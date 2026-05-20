@@ -1,0 +1,28 @@
+================================================================================
+Dynamic AI Log Session
+Started: 2026-05-20 08:40:50.893
+================================================================================
+
+[2026-05-20 08:40:50.893] [INFO   ] ============================================================
+[2026-05-20 08:40:50.893] [INFO   ] Logging system initialized
+[2026-05-20 08:40:50.893] [INFO   ] Log directory: /home/aaf/Software/Dev/gtr2_dyn_ai/logs
+[2026-05-20 08:40:50.893] [INFO   ] Current log file: /home/aaf/Software/Dev/gtr2_dyn_ai/logs/dyn_ai_20260520_084050_893.log
+[2026-05-20 08:40:50.893] [INFO   ] ============================================================
+[2026-05-20 08:40:50.893] [INFO   ] ============================================================
+[2026-05-20 08:40:50.893] [INFO   ] Dynamic AI Setup Manager Starting
+[2026-05-20 08:40:50.893] [INFO   ] ============================================================
+[2026-05-20 08:40:50.894] [INFO   ] [CONFIG] Loading config from: /home/aaf/Software/Dev/gtr2_dyn_ai/cfg.yml
+[2026-05-20 08:40:50.894] [INFO   ] [CONFIG] Loaded config with base_path: test_mocks
+[2026-05-20 08:40:50.894] [INFO   ] [CONFIG] Database path: ai_data.db
+[2026-05-20 08:40:50.894] [INFO   ] Log file: /home/aaf/Software/Dev/gtr2_dyn_ai/logs/dyn_ai_20260520_084050_893.log
+[2026-05-20 08:40:51.014] [INFO   ] [CONFIG] Loading config from: /home/aaf/Software/Dev/gtr2_dyn_ai/cfg.yml
+[2026-05-20 08:40:51.015] [INFO   ] [CONFIG] Loaded config with base_path: test_mocks
+[2026-05-20 08:40:51.015] [INFO   ] [CONFIG] Loading config from: /home/aaf/Software/Dev/gtr2_dyn_ai/cfg.yml
+[2026-05-20 08:40:51.015] [INFO   ] [CONFIG] Loaded config with base_path: test_mocks
+[2026-05-20 08:40:51.015] [INFO   ] [CONFIG] Database path: ai_data.db
+[2026-05-20 08:40:51.075] [INFO   ] [CONFIG] Loading config from: /home/aaf/Software/Dev/gtr2_dyn_ai/cfg.yml
+[2026-05-20 08:40:51.075] [INFO   ] [CONFIG] Loaded config with base_path: test_mocks
+[2026-05-20 08:40:51.152] [INFO   ] [CONFIG] Loading config from: /home/aaf/Software/Dev/gtr2_dyn_ai/cfg.yml
+[2026-05-20 08:40:51.152] [INFO   ] [CONFIG] Loaded config with base_path: test_mocks
+[2026-05-20 08:40:51.172] [INFO   ] Setup Manager UI started
+[2026-05-20 08:40:53.537] [INFO   ] Setup Manager closing

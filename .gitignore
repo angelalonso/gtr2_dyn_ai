@@ -3,6 +3,7 @@ dist/**
 Pipfile.lock
 __pycache__/**
 track_formulas/**
+logs/**
 dyn_ai.exe
 dyn_ai_setup.exe
 dyn_ai_visualizer.exe

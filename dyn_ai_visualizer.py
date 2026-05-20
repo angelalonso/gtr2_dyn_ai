@@ -22,7 +22,7 @@ from core_database import CurveDatabase
 from core_config import get_db_path, get_config_with_defaults, create_default_config_if_missing, get_base_path, get_ratio_limits
 from core_autopilot import get_vehicle_class, load_vehicle_classes, AutopilotManager
 from core_math import DEFAULT_A_VALUE, fit_hyperbolic, ratio_from_time, clamp_ratio, get_formula_string, calculate_b_from_point
-from core_aiw_utils import update_aiw_ratio, find_aiw_file_by_track, find_aiw_file_from_path, ensure_aiw_has_ratios
+from core_aiw_utils import update_aiw_ratio, find_aiw_file_by_track, ensure_aiw_has_ratios
 from core_user_laptimes import UserLapTimesManager
 from gui_curve_graph import CurveGraphWidget
 from gui_session_panel import SessionPanel
@@ -281,6 +281,7 @@ class FormulaVisualizer(QMainWindow):
         self.db_path = get_db_path(config_file)
         self.db = CurveDatabase(self.db_path)
         self.base_path = get_base_path(config_file)
+        self.min_ratio, self.max_ratio = get_ratio_limits(config_file)
         
         # Load vehicle classes
         vehicle_classes_path = get_data_file_path("vehicle_classes.json")
@@ -288,6 +289,7 @@ class FormulaVisualizer(QMainWindow):
         
         # Initialize autopilot manager
         self.autopilot_manager = AutopilotManager(self.db)
+        self.autopilot_manager.set_ratio_limits(self.min_ratio, self.max_ratio)
         
         # Initialize user laptimes manager
         from core_config import get_nr_last_user_laptimes
@@ -356,6 +358,10 @@ class FormulaVisualizer(QMainWindow):
         self.setup_ui()
         self.setup_db_watcher()
         self.setup_refresh_timer()
+        
+        # Connect lock signals
+        self.qual_panel.lock_toggled.connect(self.on_lock_toggled)
+        self.race_panel.lock_toggled.connect(self.on_lock_toggled)
         
         # Load initial data after UI is ready
         self.selector.load_data()
@@ -610,6 +616,11 @@ class FormulaVisualizer(QMainWindow):
         if not self.current_track or not self.current_vehicle_class:
             return
         
+        # Ensure panels have the current track and class
+        if hasattr(self, 'qual_panel'):
+            self.qual_panel.set_current_track_class(self.current_track, self.current_vehicle_class)
+            self.race_panel.set_current_track_class(self.current_track, self.current_vehicle_class)
+        
         if hasattr(self, 'qual_panel'):
             self.qual_panel.set_formula_is_default(self.qual_is_default)
             self.qual_panel.update_formula(self.qual_a, self.qual_b)
@@ -650,6 +661,8 @@ class FormulaVisualizer(QMainWindow):
             )
             self.curve_graph.update_graph()
         
+        self.update_formula_lock_status()
+        
         title = f"Dynamic AI - Formula Visualizer - {self.current_track} - {self.current_vehicle_class}"
         if not self.qual_is_default or not self.race_is_default:
             formulas = []
@@ -660,6 +673,53 @@ class FormulaVisualizer(QMainWindow):
             if formulas:
                 title += f" [{' | '.join(formulas)}]"
         self.setWindowTitle(title)
+
+    # ------------------------------------------------------------------
+    # Formula locking
+    # ------------------------------------------------------------------
+
+    def on_lock_toggled(self, session_type: str, is_locked: bool):
+        """Handle lock toggle from session panel"""
+        if not self.current_track or not self.current_vehicle_class:
+            # Revert the toggle if no selection
+            if session_type == "qual":
+                self.qual_panel.set_locked_status(False)
+            else:
+                self.race_panel.set_locked_status(False)
+            QMessageBox.warning(self, "No Selection", "Please select a track and vehicle class first.")
+            return
+        
+        if is_locked:
+            success = self.autopilot_manager.lock_formula(self.current_track, self.current_vehicle_class, session_type, "")
+            if not success:
+                if session_type == "qual":
+                    self.qual_panel.set_locked_status(False)
+                else:
+                    self.race_panel.set_locked_status(False)
+                QMessageBox.warning(self, "Lock Failed", "Could not lock formula. It may not exist yet.")
+            else:
+                logger.info(f"Locked {session_type} formula for {self.current_track}/{self.current_vehicle_class}")
+        else:
+            success = self.autopilot_manager.unlock_formula(self.current_track, self.current_vehicle_class, session_type)
+            if not success:
+                if session_type == "qual":
+                    self.qual_panel.set_locked_status(True)
+                else:
+                    self.race_panel.set_locked_status(True)
+                QMessageBox.warning(self, "Unlock Failed", "Could not unlock formula.")
+            else:
+                logger.info(f"Unlocked {session_type} formula for {self.current_track}/{self.current_vehicle_class}")
+    
+    def update_formula_lock_status(self):
+        """Update the lock status display in panels"""
+        if not self.current_track or not self.current_vehicle_class:
+            return
+        
+        qual_locked = self.autopilot_manager.is_formula_locked(self.current_track, self.current_vehicle_class, "qual")
+        self.qual_panel.set_locked_status(qual_locked)
+        
+        race_locked = self.autopilot_manager.is_formula_locked(self.current_track, self.current_vehicle_class, "race")
+        self.race_panel.set_locked_status(race_locked)
 
     # ------------------------------------------------------------------
     # UI setup
@@ -745,6 +805,10 @@ class FormulaVisualizer(QMainWindow):
         self.current_track = track
         self.current_vehicle_class = vehicle_class
         
+        # Update session panels with current track and class
+        self.qual_panel.set_current_track_class(track, vehicle_class)
+        self.race_panel.set_current_track_class(track, vehicle_class)
+        
         if self.curve_graph:
             self.curve_graph.current_track = track
             self.curve_graph.selected_classes = [vehicle_class]
@@ -777,6 +841,14 @@ class FormulaVisualizer(QMainWindow):
                 confidence=0.7
             )
             if formula.is_valid():
+                # Check if formula is locked - preserve lock status
+                existing = self.autopilot_manager.formula_manager.get_formula_by_class(
+                    self.current_track, self.current_vehicle_class, "qual"
+                )
+                if existing and existing.is_locked:
+                    formula.is_locked = existing.is_locked
+                    formula.locked_by_user = existing.locked_by_user
+                    formula.lock_reason = existing.lock_reason
                 self.autopilot_manager.formula_manager.save_formula(formula)
                 logger.info(f"Saved qual formula for {self.current_track}/{self.current_vehicle_class}: {get_formula_string(a, b)}")
                 QTimer.singleShot(100, lambda: self.load_current_data())
@@ -803,6 +875,14 @@ class FormulaVisualizer(QMainWindow):
                 confidence=0.7
             )
             if formula.is_valid():
+                # Check if formula is locked - preserve lock status
+                existing = self.autopilot_manager.formula_manager.get_formula_by_class(
+                    self.current_track, self.current_vehicle_class, "race"
+                )
+                if existing and existing.is_locked:
+                    formula.is_locked = existing.is_locked
+                    formula.locked_by_user = existing.locked_by_user
+                    formula.lock_reason = existing.lock_reason
                 self.autopilot_manager.formula_manager.save_formula(formula)
                 logger.info(f"Saved race formula for {self.current_track}/{self.current_vehicle_class}: {get_formula_string(a, b)}")
                 QTimer.singleShot(100, lambda: self.load_current_data())
@@ -883,7 +963,7 @@ class FormulaVisualizer(QMainWindow):
             
             self.autopilot_manager.formula_manager.update_formula_with_point(
                 self.current_track, self.current_vehicle_class, session_type,
-                new_ratio, user_time
+                new_ratio, user_time, self.min_ratio, self.max_ratio
             )
             
             self.load_current_data()
@@ -900,6 +980,13 @@ class FormulaVisualizer(QMainWindow):
         if not self.current_track or not self.current_vehicle_class:
             QMessageBox.warning(self, "No Data", 
                 "No track or vehicle class selected. Please select a track and class first.")
+            return
+        
+        # Check if formula is locked
+        is_locked = self.autopilot_manager.is_formula_locked(self.current_track, self.current_vehicle_class, session_type)
+        if is_locked:
+            QMessageBox.warning(self, "Formula Locked", 
+                "This formula is locked. Unlock it first to use Auto-Fit.")
             return
         
         logger.info(f"Auto-fit for {session_type} on {self.current_track}/{self.current_vehicle_class}")
@@ -929,14 +1016,27 @@ class FormulaVisualizer(QMainWindow):
         from core_config import get_outlier_settings
         outlier_config = get_outlier_settings(self.config_file)
         
+        # Determine if we should optimize A
+        optimize_a = len(rows) <= 3
+        
         a, b, stats = fit_hyperbolic(
             ratios, times,
             fixed_a=None,
             outlier_method=outlier_config['method'],
-            outlier_threshold=outlier_config['threshold']
+            outlier_threshold=outlier_config['threshold'],
+            optimize_a=optimize_a,
+            min_ratio_limit=self.min_ratio,
+            max_ratio_limit=self.max_ratio
         )
         
         if a is not None and b is not None:
+            # Preserve lock status if formula exists
+            existing = self.autopilot_manager.formula_manager.get_formula_by_class(
+                self.current_track, self.current_vehicle_class, session_filter
+            )
+            is_locked = existing.is_locked if existing else False
+            lock_reason = existing.lock_reason if existing else ""
+            
             if session_type == "qual":
                 self.qual_a = a
                 self.qual_b = b
@@ -970,7 +1070,10 @@ class FormulaVisualizer(QMainWindow):
                 confidence=0.7,
                 data_points_used=stats.points_used,
                 avg_error=stats.avg_error,
-                max_error=stats.max_error
+                max_error=stats.max_error,
+                is_locked=is_locked,
+                locked_by_user=is_locked,
+                lock_reason=lock_reason
             )
             self.autopilot_manager.formula_manager.save_formula(formula)
             
@@ -978,11 +1081,15 @@ class FormulaVisualizer(QMainWindow):
             if stats.outliers_removed > 0:
                 outlier_msg = f"\nRemoved {stats.outliers_removed} outlier(s)."
             
+            opt_msg = ""
+            if stats.a_optimized:
+                opt_msg = f"\nA was optimized from {stats.original_a:.2f} to {stats.new_a:.2f}."
+            
             QMessageBox.information(self, "Auto-Fit Complete", 
                 f"Fitted curve for {session_type.upper()} using {stats.points_used} data points.\n\n"
                 f"Formula: {get_formula_string(a, b)}\n"
                 f"Average error: {stats.avg_error:.3f}s\n"
-                f"Max error: {stats.max_error:.3f}s{outlier_msg}\n\n"
+                f"Max error: {stats.max_error:.3f}s{outlier_msg}{opt_msg}\n\n"
                 f"The formula has been saved to the database.")
         else:
             QMessageBox.warning(self, "Fit Failed", 
@@ -1002,7 +1109,7 @@ class FormulaVisualizer(QMainWindow):
             
             self.autopilot_manager.formula_manager.update_formula_with_point(
                 self.current_track, self.current_vehicle_class, session_type,
-                current_ratio, new_time
+                current_ratio, new_time, self.min_ratio, self.max_ratio
             )
             
             median_time = self.user_laptimes_manager.get_median_laptime_for_combo(
@@ -1031,6 +1138,8 @@ class FormulaVisualizer(QMainWindow):
                     median_race_time=self.median_race_time
                 )
                 self.curve_graph.update_graph()
+            
+            self.update_formula_lock_status()
 
 
 def main():

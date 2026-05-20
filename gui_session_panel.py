@@ -6,7 +6,7 @@ Provides the qualifying and race session control panels
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QGroupBox, QCheckBox, QDoubleSpinBox, QMessageBox, QDialog
+    QGroupBox, QCheckBox, QDoubleSpinBox, QMessageBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -23,6 +23,7 @@ class SessionPanel(QWidget):
     calculate_ratio = pyqtSignal(str, float)
     auto_fit_requested = pyqtSignal(str)
     lap_time_edited = pyqtSignal(str, float)
+    lock_toggled = pyqtSignal(str, bool)  # session_type, is_locked
     
     def __init__(self, session_type: str, title: str, db, parent=None):
         super().__init__(parent)
@@ -38,8 +39,18 @@ class SessionPanel(QWidget):
         self.median_time = None
         self.calc_button_modified = False
         self.formula_is_default = True
+        self.formula_is_locked = False
+        
+        # Store current track and class - will be updated from main window
+        self.current_track = ""
+        self.current_vehicle_class = ""
         
         self.setup_ui()
+    
+    def set_current_track_class(self, track: str, vehicle_class: str):
+        """Set the current track and vehicle class from the main window"""
+        self.current_track = track
+        self.current_vehicle_class = vehicle_class
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -162,10 +173,26 @@ class SessionPanel(QWidget):
         self.auto_fit_btn.setStyleSheet("background-color: #2196F3;")
         self.auto_fit_btn.clicked.connect(self.on_auto_fit_clicked)
         row4.addWidget(self.auto_fit_btn)
+        
+        self.lock_btn = QPushButton("Lock")
+        self.lock_btn.setStyleSheet("background-color: #9C27B0;")
+        self.lock_btn.setCheckable(True)
+        self.lock_btn.clicked.connect(self.on_lock_toggled)
+        row4.addWidget(self.lock_btn)
+        
         row4.addStretch()
         group_layout.addLayout(row4)
 
         layout.addWidget(group)
+    
+    def update_controls_enabled(self):
+        """Update enabled state of formula controls based on lock status"""
+        enabled = not self.formula_is_locked
+        self.a_spin.setEnabled(enabled)
+        self.b_spin.setEnabled(enabled)
+        self.auto_fit_btn.setEnabled(enabled)
+        # Calculate button still works with locked formula (just uses existing formula)
+        # Lock button itself is always enabled to allow unlocking
     
     def update_current_ratio(self, ratio: float):
         """Update the displayed current ratio"""
@@ -187,7 +214,11 @@ class SessionPanel(QWidget):
             self.formula_label.setStyleSheet("color: #FFA500; font-family: monospace;")
     
     def on_auto_fit_clicked(self):
-        """Emit auto_fit_requested signal"""
+        """Emit auto_fit_requested signal - only if not locked"""
+        if self.formula_is_locked:
+            QMessageBox.warning(self, "Formula Locked", 
+                "This formula is locked. Unlock it first to use Auto-Fit.")
+            return
         self.auto_fit_requested.emit(self.session_type)
     
     def update_median_time(self, median_time: float):
@@ -213,6 +244,9 @@ class SessionPanel(QWidget):
         self.show_data_toggled.emit(self.session_type, checked)
         
     def on_param_changed(self):
+        if self.formula_is_locked:
+            # This shouldn't happen because spinboxes are disabled, but just in case
+            return
         self.a = self.a_spin.value()
         self.b = self.b_spin.value()
         self.formula_label.setText(get_formula_string(self.a, self.b))
@@ -261,6 +295,38 @@ class SessionPanel(QWidget):
             self.set_calc_button_modified(False)
         else:
             QMessageBox.warning(self, "No Time", "No user time available for this session.\n\nClick the 'Edit' button to set a lap time manually.")
+    
+    def on_lock_toggled(self, checked):
+        """Handle lock button toggle - simple without dialog"""
+        self.formula_is_locked = checked
+        
+        if checked:
+            self.lock_btn.setText("Locked")
+            self.lock_btn.setStyleSheet("background-color: #f44336;")
+            self.lock_btn.setToolTip("Formula is locked - auto-updates disabled")
+        else:
+            self.lock_btn.setText("Lock")
+            self.lock_btn.setStyleSheet("background-color: #9C27B0;")
+            self.lock_btn.setToolTip("Lock formula to prevent auto-updates")
+        
+        self.update_controls_enabled()
+        self.lock_toggled.emit(self.session_type, checked)
+            
+    def set_locked_status(self, is_locked: bool):
+        """Set the locked status display from external source"""
+        self.formula_is_locked = is_locked
+        self.lock_btn.blockSignals(True)
+        self.lock_btn.setChecked(is_locked)
+        if is_locked:
+            self.lock_btn.setText("Locked")
+            self.lock_btn.setStyleSheet("background-color: #f44336;")
+            self.lock_btn.setToolTip("Formula is locked - auto-updates disabled")
+        else:
+            self.lock_btn.setText("Lock")
+            self.lock_btn.setStyleSheet("background-color: #9C27B0;")
+            self.lock_btn.setToolTip("Lock formula to prevent auto-updates")
+        self.lock_btn.blockSignals(False)
+        self.update_controls_enabled()
             
     def update_formula(self, a: float, b: float):
         self.a = a

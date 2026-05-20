@@ -17,11 +17,11 @@ from datetime import datetime
 from core_math import (
     DEFAULT_A_VALUE, time_from_ratio, ratio_from_time, clamp_ratio, 
     clamp_b, is_valid_formula, calculate_b_from_point, fit_hyperbolic,
-    get_formula_string
+    get_formula_string, calculate_error_metrics, should_suggest_manual_adjustment
 )
 from core_database import CurveDatabase
 from core_data_extraction import RaceData
-from core_config import get_base_path, get_nr_last_user_laptimes
+from core_config import get_base_path, get_nr_last_user_laptimes, get_ratio_limits
 from core_aiw_utils import find_aiw_file_from_path, find_aiw_file_by_track, update_aiw_ratio, ensure_aiw_has_ratios
 from core_user_laptimes import UserLapTimesManager
 
@@ -114,6 +114,9 @@ class Formula:
     avg_error: float = 0.0
     max_error: float = 0.0
     vehicles_in_class: Set[str] = field(default_factory=set)
+    is_locked: bool = False
+    locked_by_user: bool = False
+    lock_reason: str = ""
     
     def get_time_at_ratio(self, ratio: float) -> float:
         """Calculate time from ratio using the formula"""
@@ -131,9 +134,14 @@ class Formula:
         """Get formatted formula string"""
         return get_formula_string(self.a, self.b)
     
+    def should_auto_update(self) -> bool:
+        """Determine if formula should be auto-updated (not locked by user)"""
+        return not (self.is_locked and self.locked_by_user)
+    
     @classmethod
     def from_point(cls, track: str, vehicle_class: str, ratio: float, 
-                   lap_time: float, session_type: str, a_value: float = DEFAULT_A_VALUE) -> 'Formula':
+                   lap_time: float, session_type: str, a_value: float = DEFAULT_A_VALUE,
+                   is_locked: bool = False) -> 'Formula':
         """Create formula from a single data point"""
         b = calculate_b_from_point(ratio, lap_time, a_value)
         logger.debug(f"Created formula from point: a={a_value:.4f}, b={b:.4f}")
@@ -145,7 +153,9 @@ class Formula:
             session_type=session_type,
             confidence=0.5,
             data_points_used=1,
-            vehicles_in_class={vehicle_class}
+            vehicles_in_class={vehicle_class},
+            is_locked=is_locked,
+            locked_by_user=is_locked
         )
     
     @classmethod
@@ -153,14 +163,38 @@ class Formula:
                     ratios: List[float], times: List[float], 
                     fixed_a: Optional[float] = None,
                     outlier_method: str = "none",
-                    outlier_threshold: float = 2.0) -> Optional['Formula']:
+                    outlier_threshold: float = 2.0,
+                    optimize_a: bool = False,
+                    min_ratio_limit: float = 0.5,
+                    max_ratio_limit: float = 1.5,
+                    is_locked: bool = False) -> Optional['Formula']:
         """Create formula by fitting to multiple data points"""
-        a, b, stats = fit_hyperbolic(ratios, times, fixed_a=fixed_a,
-                                      outlier_method=outlier_method,
-                                      outlier_threshold=outlier_threshold)
+        a, b, stats = fit_hyperbolic(
+            ratios, times, 
+            fixed_a=fixed_a,
+            outlier_method=outlier_method,
+            outlier_threshold=outlier_threshold,
+            optimize_a=optimize_a,
+            min_ratio_limit=min_ratio_limit,
+            max_ratio_limit=max_ratio_limit
+        )
         
         if a is None or b is None:
             return None
+        
+        # Calculate error metrics for confidence
+        error_metrics = calculate_error_metrics(ratios, times, a, b)
+        
+        # Determine confidence based on R-squared
+        r_squared = error_metrics.get('r_squared', 0)
+        if r_squared >= 0.95:
+            confidence = 0.95
+        elif r_squared >= 0.85:
+            confidence = 0.85
+        elif r_squared >= 0.70:
+            confidence = 0.70
+        else:
+            confidence = 0.50
         
         return cls(
             track=track,
@@ -168,11 +202,13 @@ class Formula:
             a=a,
             b=b,
             session_type=session_type,
-            confidence=0.7 if stats.points_used >= 3 else 0.5,
+            confidence=confidence,
             data_points_used=stats.points_used,
             avg_error=stats.avg_error,
             max_error=stats.max_error,
-            vehicles_in_class={vehicle_class}
+            vehicles_in_class={vehicle_class},
+            is_locked=is_locked,
+            locked_by_user=is_locked
         )
 
 
@@ -204,7 +240,9 @@ class FormulaManager:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 last_used TEXT DEFAULT CURRENT_TIMESTAMP,
                 a_value REAL DEFAULT 32.0,
-                UNIQUE(track, vehicle_class, session_type)
+                is_locked INTEGER DEFAULT 0,
+                locked_by_user INTEGER DEFAULT 0,
+                lock_reason TEXT DEFAULT ''
             )
         """)
         
@@ -212,6 +250,12 @@ class FormulaManager:
         columns = [col[1] for col in cursor.fetchall()]
         if 'a_value' not in columns:
             cursor.execute("ALTER TABLE formulas ADD COLUMN a_value REAL DEFAULT 32.0")
+        if 'is_locked' not in columns:
+            cursor.execute("ALTER TABLE formulas ADD COLUMN is_locked INTEGER DEFAULT 0")
+        if 'locked_by_user' not in columns:
+            cursor.execute("ALTER TABLE formulas ADD COLUMN locked_by_user INTEGER DEFAULT 0")
+        if 'lock_reason' not in columns:
+            cursor.execute("ALTER TABLE formulas ADD COLUMN lock_reason TEXT DEFAULT ''")
         
         conn.commit()
         conn.close()
@@ -222,7 +266,8 @@ class FormulaManager:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT track, vehicle_class, a, b, session_type, confidence, 
-                   data_points_used, avg_error, max_error, vehicles_in_class, a_value 
+                   data_points_used, avg_error, max_error, vehicles_in_class, a_value,
+                   is_locked, locked_by_user, lock_reason
             FROM formulas
         """)
         rows = cursor.fetchall()
@@ -233,11 +278,15 @@ class FormulaManager:
         for row in rows:
             vehicles_str = row[9] if len(row) > 9 else ""
             vehicles_set = set(vehicles_str.split(',')) if vehicles_str else set()
+            is_locked = bool(row[11]) if len(row) > 11 else False
+            locked_by_user = bool(row[12]) if len(row) > 12 else False
+            lock_reason = row[13] if len(row) > 13 else ""
             
             formula = Formula(
                 track=row[0], vehicle_class=row[1], a=row[2], b=row[3],
                 session_type=row[4], confidence=row[5], data_points_used=row[6],
-                avg_error=row[7], max_error=row[8], vehicles_in_class=vehicles_set
+                avg_error=row[7], max_error=row[8], vehicles_in_class=vehicles_set,
+                is_locked=is_locked, locked_by_user=locked_by_user, lock_reason=lock_reason
             )
             if formula.is_valid():
                 if formula.track not in self._formulas:
@@ -296,11 +345,15 @@ class FormulaManager:
         cursor.execute("""
             INSERT OR REPLACE INTO formulas 
             (track, vehicle_class, a, b, session_type, confidence, data_points_used, 
-             avg_error, max_error, vehicles_in_class, last_used, a_value)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-        """, (formula.track, formula.vehicle_class, formula.a, formula.b, 
-              formula.session_type, formula.confidence, formula.data_points_used,
-              formula.avg_error, formula.max_error, vehicles_str, formula.a))
+             avg_error, max_error, vehicles_in_class, last_used, a_value,
+             is_locked, locked_by_user, lock_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+        """, (
+            formula.track, formula.vehicle_class, formula.a, formula.b, 
+            formula.session_type, formula.confidence, formula.data_points_used,
+            formula.avg_error, formula.max_error, vehicles_str, formula.a,
+            1 if formula.is_locked else 0, 1 if formula.locked_by_user else 0, formula.lock_reason
+        ))
         conn.commit()
         conn.close()
         
@@ -310,8 +363,65 @@ class FormulaManager:
             self._formulas[formula.track][formula.vehicle_class] = {}
         self._formulas[formula.track][formula.vehicle_class][formula.session_type] = formula
         
-        logger.debug(f"Saved formula for {formula.track}/{formula.vehicle_class}/{formula.session_type}: {formula.get_formula_string()}")
+        logger.debug(f"Saved formula for {formula.track}/{formula.vehicle_class}/{formula.session_type}: {formula.get_formula_string()} (locked={formula.is_locked})")
         return True
+    
+    def lock_formula(self, track: str, vehicle_class: str, session_type: str, reason: str = "") -> bool:
+        """Lock a formula so it won't be auto-updated"""
+        formula = self.get_formula_by_class(track, vehicle_class, session_type)
+        if not formula:
+            logger.warning(f"Cannot lock formula: not found for {track}/{vehicle_class}/{session_type}")
+            return False
+        
+        new_formula = Formula(
+            track=formula.track,
+            vehicle_class=formula.vehicle_class,
+            a=formula.a,
+            b=formula.b,
+            session_type=formula.session_type,
+            confidence=formula.confidence,
+            data_points_used=formula.data_points_used,
+            avg_error=formula.avg_error,
+            max_error=formula.max_error,
+            vehicles_in_class=formula.vehicles_in_class,
+            is_locked=True,
+            locked_by_user=True,
+            lock_reason=reason
+        )
+        return self.save_formula(new_formula)
+    
+    def unlock_formula(self, track: str, vehicle_class: str, session_type: str) -> bool:
+        """Unlock a formula to allow auto-updates"""
+        formula = self.get_formula_by_class(track, vehicle_class, session_type)
+        if not formula:
+            return False
+        
+        new_formula = Formula(
+            track=formula.track,
+            vehicle_class=formula.vehicle_class,
+            a=formula.a,
+            b=formula.b,
+            session_type=formula.session_type,
+            confidence=formula.confidence,
+            data_points_used=formula.data_points_used,
+            avg_error=formula.avg_error,
+            max_error=formula.max_error,
+            vehicles_in_class=formula.vehicles_in_class,
+            is_locked=False,
+            locked_by_user=False,
+            lock_reason=""
+        )
+        return self.save_formula(new_formula)
+    
+    def is_formula_locked(self, track: str, vehicle_class: str, session_type: str) -> bool:
+        """Check if a formula is locked"""
+        formula = self.get_formula_by_class(track, vehicle_class, session_type)
+        return formula.is_locked if formula else False
+    
+    def get_lock_reason(self, track: str, vehicle_class: str, session_type: str) -> str:
+        """Get the lock reason for a locked formula"""
+        formula = self.get_formula_by_class(track, vehicle_class, session_type)
+        return formula.lock_reason if formula else ""
     
     def update_formula_a_value(self, track: str, vehicle_class: str, session_type: str, a_value: float) -> bool:
         formula = self.get_formula_by_class(track, vehicle_class, session_type)
@@ -326,14 +436,23 @@ class FormulaManager:
             session_type=formula.session_type,
             confidence=formula.confidence,
             data_points_used=formula.data_points_used,
-            vehicles_in_class=formula.vehicles_in_class
+            vehicles_in_class=formula.vehicles_in_class,
+            is_locked=formula.is_locked,
+            locked_by_user=formula.locked_by_user,
+            lock_reason=formula.lock_reason
         )
         return self.save_formula(new_formula)
     
     def update_formula_with_point(self, track: str, vehicle_class: str, session_type: str,
-                                   ratio: float, lap_time: float) -> Optional[Formula]:
+                                   ratio: float, lap_time: float,
+                                   min_ratio_limit: float = 0.5, max_ratio_limit: float = 1.5) -> Optional[Formula]:
         """Update formula by adding a new data point"""
         existing = self.get_formula_by_class(track, vehicle_class, session_type)
+        
+        # Don't update if formula is locked by user
+        if existing and existing.is_locked and existing.locked_by_user:
+            logger.info(f"Formula for {track}/{vehicle_class}/{session_type} is locked by user, not updating")
+            return existing
         
         if existing and existing.data_points_used >= 1:
             # Get all points from database for this combo
@@ -353,19 +472,60 @@ class FormulaManager:
                 ratios.append(ratio)
                 times.append(lap_time)
                 
-                # Refit keeping a fixed
+                # Determine if we should optimize A
+                optimize_a = len(ratios) <= 3 or existing.confidence < 0.7
+                
+                # Refit, possibly optimizing A
                 new_formula = Formula.from_points(
                     track, vehicle_class, session_type,
-                    ratios, times, fixed_a=existing.a
+                    ratios, times, fixed_a=None if optimize_a else existing.a,
+                    optimize_a=optimize_a,
+                    min_ratio_limit=min_ratio_limit,
+                    max_ratio_limit=max_ratio_limit,
+                    is_locked=existing.is_locked
                 )
                 if new_formula:
                     self.save_formula(new_formula)
                     return new_formula
         
         # No existing formula or not enough points, create from single point
-        new_formula = Formula.from_point(track, vehicle_class, ratio, lap_time, session_type)
+        # For first point, calculate optimal A to hit the center
+        min_ratio, max_ratio = min_ratio_limit, max_ratio_limit
+        center_ratio = min_ratio + ((max_ratio - min_ratio) / 2)
+        optimal_a = (lap_time - MIN_B) * center_ratio
+        optimal_a = max(MIN_A, min(MAX_A, optimal_a))
+        
+        new_formula = Formula.from_point(
+            track, vehicle_class, ratio, lap_time, session_type, 
+            a_value=optimal_a, is_locked=False
+        )
         self.save_formula(new_formula)
         return new_formula
+    
+    def check_formula_quality(self, track: str, vehicle_class: str, session_type: str) -> Tuple[bool, str]:
+        """Check formula quality and return whether manual adjustment is suggested"""
+        formula = self.get_formula_by_class(track, vehicle_class, session_type)
+        if not formula or formula.data_points_used < 2:
+            return False, ""
+        
+        # Get all data points for this combo
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ratio, lap_time FROM data_points 
+            WHERE track = ? AND vehicle_class = ? AND session_type = ?
+        """, (track, vehicle_class, session_type))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if len(rows) < 2:
+            return False, ""
+        
+        ratios = [r[0] for r in rows]
+        times = [r[1] for r in rows]
+        
+        error_metrics = calculate_error_metrics(ratios, times, formula.a, formula.b)
+        return should_suggest_manual_adjustment(error_metrics, len(rows))
 
 
 class AutopilotEngine:
@@ -374,6 +534,11 @@ class AutopilotEngine:
         self.formula_manager = formula_manager
         self._class_mapping = load_vehicle_classes()
         self.user_laptimes_manager = None
+        self._min_ratio, self._max_ratio = 0.5, 1.5
+    
+    def set_ratio_limits(self, min_ratio: float, max_ratio: float):
+        self._min_ratio = min_ratio
+        self._max_ratio = max_ratio
     
     def set_user_laptimes_manager(self, manager: UserLapTimesManager):
         self.user_laptimes_manager = manager
@@ -456,18 +621,30 @@ class AutopilotEngine:
     def _get_or_create_formula(self, track: str, vehicle_class: str, session_type: str, 
                                 current_ratio: float, target_time: float) -> Formula:
         formula = self.formula_manager.get_formula_by_class(track, vehicle_class, session_type)
+        
+        # Check if formula is locked - don't modify if locked by user
+        if formula and formula.is_locked and formula.locked_by_user:
+            logger.info(f"Formula for {track}/{vehicle_class}/{session_type} is locked by user, using existing formula without update")
+            return formula
+        
         if formula:
             # Update formula with new point
             updated = self.formula_manager.update_formula_with_point(
-                track, vehicle_class, session_type, current_ratio, target_time
+                track, vehicle_class, session_type, current_ratio, target_time,
+                self._min_ratio, self._max_ratio
             )
             if updated:
                 logger.info(f"Formula for Track {track}, car class {vehicle_class} updated to {updated.get_formula_string()}")
                 return updated
             return formula
         else:
-            logger.debug(f"Creating new formula for {track}/{vehicle_class}/{session_type} (base a={DEFAULT_A_VALUE})")
-            new_formula = Formula.from_point(track, vehicle_class, current_ratio, target_time, session_type, DEFAULT_A_VALUE)
+            logger.debug(f"Creating new formula for {track}/{vehicle_class}/{session_type}")
+            # For first point, calculate optimal A to hit the center
+            center_ratio = self._min_ratio + ((self._max_ratio - self._min_ratio) / 2)
+            optimal_a = (target_time - MIN_B) * center_ratio
+            optimal_a = max(MIN_A, min(MAX_A, optimal_a))
+            
+            new_formula = Formula.from_point(track, vehicle_class, current_ratio, target_time, session_type, optimal_a)
             self.formula_manager.save_formula(new_formula)
             return new_formula
     
@@ -526,19 +703,51 @@ class AutopilotEngine:
         
         existing_formula = self.formula_manager.get_formula_by_class(track, vehicle_class, session_type)
         
+        # Check if formula is locked - if locked by user, use it as is without modification
+        if existing_formula and existing_formula.is_locked and existing_formula.locked_by_user:
+            logger.info(f"Formula for {track}/{vehicle_class}/{session_type} is locked by user: {existing_formula.lock_reason}")
+            a = existing_formula.a
+            b = existing_formula.b
+            result["formula"] = existing_formula
+            
+            # Still calculate new ratio using locked formula
+            effective_user_time = user_lap_time
+            if user_lap_time > 0:
+                median_time = self._get_median_user_laptime(track, vehicle_class, session_type)
+                if median_time is not None:
+                    effective_user_time = median_time
+                self._add_user_laptime(track, vehicle_class, session_type, user_lap_time, current_ratio)
+            
+            new_ratio = None
+            if effective_user_time > 0:
+                new_ratio = self._calculate_new_ratio_direct(effective_user_time, a, b)
+                if new_ratio:
+                    new_ratio = clamp_ratio(new_ratio, self._min_ratio, self._max_ratio)
+            
+            if new_ratio and abs(new_ratio - current_ratio) > 0.000001:
+                logger.info(f"Updating {ratio_name} from {current_ratio:.6f} to {new_ratio:.6f} (using locked formula)")
+                if self._update_aiw_ratio(actual_aiw_path, ratio_name, new_ratio):
+                    result["updated"] = True
+                    result["new_ratio"] = new_ratio
+            return result
+        
         if existing_formula and existing_formula.is_valid():
             a = existing_formula.a
             b = existing_formula.b
             logger.debug(f"Using existing formula: a={a:.2f}, b={b:.2f}")
             result["formula"] = existing_formula
         else:
-            a = DEFAULT_A_VALUE
-            if current_ratio > 0 and user_lap_time > 0:
+            # For first point, calculate optimal A to hit the center
+            center_ratio = self._min_ratio + ((self._max_ratio - self._min_ratio) / 2)
+            if user_lap_time > 0 and current_ratio > 0:
+                a = (user_lap_time - MIN_B) * center_ratio
+                a = max(MIN_A, min(MAX_A, a))
                 b = calculate_b_from_point(current_ratio, user_lap_time, a)
-                logger.debug(f"No formula found, estimating b from current data: b={b:.2f}")
+                logger.debug(f"No formula found, estimating a from center: a={a:.2f}, b={b:.2f}")
             else:
+                a = DEFAULT_A_VALUE
                 b = 70.0
-                logger.debug(f"No formula found, using default b={b:.2f}")
+                logger.debug(f"No formula found, using default a={a:.2f}, b={b:.2f}")
         
         effective_user_time = user_lap_time
         
@@ -558,7 +767,7 @@ class AutopilotEngine:
                 logger.debug(f"Cannot calculate ratio: denominator <= 0")
         
         if new_ratio:
-            clamped_ratio = clamp_ratio(new_ratio)
+            clamped_ratio = clamp_ratio(new_ratio, self._min_ratio, self._max_ratio)
             if clamped_ratio != new_ratio:
                 logger.debug(f"Ratio clamped from {new_ratio:.6f} to {clamped_ratio:.6f}")
                 new_ratio = clamped_ratio
@@ -573,7 +782,7 @@ class AutopilotEngine:
                 target_time = self.calculate_target_time_from_settings(best_ai_time, worst_ai_time, ai_target_settings)
                 adjusted_ratio = self._calculate_new_ratio_direct(target_time, a, b)
                 if adjusted_ratio:
-                    adjusted_ratio = clamp_ratio(adjusted_ratio)
+                    adjusted_ratio = clamp_ratio(adjusted_ratio, self._min_ratio, self._max_ratio)
                     if abs(adjusted_ratio - current_ratio) > 0.000001:
                         logger.debug(f"Adjusted for AI target: {adjusted_ratio:.6f}")
                         new_ratio = adjusted_ratio
@@ -591,11 +800,19 @@ class AutopilotEngine:
         if effective_user_time > 0:
             target_time_for_formula = effective_user_time
             updated_formula = self.formula_manager.update_formula_with_point(
-                track, vehicle_class, session_type, current_ratio, target_time_for_formula
+                track, vehicle_class, session_type, current_ratio, target_time_for_formula,
+                self._min_ratio, self._max_ratio
             )
             if updated_formula:
                 result["formula"] = updated_formula
                 logger.debug(f"Updated formula with new data point")
+                
+                # Check formula quality and suggest manual adjustment
+                should_suggest, reason = self.formula_manager.check_formula_quality(track, vehicle_class, session_type)
+                if should_suggest:
+                    logger.warning(f"Formula quality warning for {track}/{vehicle_class}/{session_type}: {reason}")
+                    result["suggest_manual"] = True
+                    result["suggest_reason"] = reason
             elif existing_formula:
                 result["formula"] = existing_formula
         
@@ -616,7 +833,11 @@ class AutopilotEngine:
             "race_old_ratio": None,
             "qual_formula": None,
             "race_formula": None,
-            "message": ""
+            "message": "",
+            "qual_suggest_manual": False,
+            "race_suggest_manual": False,
+            "qual_suggest_reason": "",
+            "race_suggest_reason": ""
         }
         
         if not race_data.track_name:
@@ -664,6 +885,8 @@ class AutopilotEngine:
             result["qual_updated"] = qual_result["updated"]
             result["qual_new_ratio"] = qual_result["new_ratio"]
             result["qual_formula"] = qual_result["formula"]
+            result["qual_suggest_manual"] = qual_result.get("suggest_manual", False)
+            result["qual_suggest_reason"] = qual_result.get("suggest_reason", "")
         
         if has_race:
             result["race_old_ratio"] = race_data.race_ratio
@@ -676,6 +899,8 @@ class AutopilotEngine:
             result["race_updated"] = race_result["updated"]
             result["race_new_ratio"] = race_result["new_ratio"]
             result["race_formula"] = race_result["formula"]
+            result["race_suggest_manual"] = race_result.get("suggest_manual", False)
+            result["race_suggest_reason"] = race_result.get("suggest_reason", "")
         
         result["success"] = result["qual_updated"] or result["race_updated"]
         
@@ -686,6 +911,10 @@ class AutopilotEngine:
             logger.debug(f"QUALIFYING: {result['qual_old_ratio']:.6f} -> {result['qual_new_ratio']:.6f}")
         if result["race_updated"]:
             logger.debug(f"RACE: {result['race_old_ratio']:.6f} -> {result['race_new_ratio']:.6f}")
+        if result.get("qual_suggest_manual", False):
+            logger.debug(f"QUALIFYING SUGGESTION: {result['qual_suggest_reason']}")
+        if result.get("race_suggest_manual", False):
+            logger.debug(f"RACE SUGGESTION: {result['race_suggest_reason']}")
         logger.debug(f"{'='*70}\n")
         
         return result
@@ -693,8 +922,12 @@ class AutopilotEngine:
     def calculate_ratio_from_formula(self, track: str, vehicle_class: str, session_type: str, lap_time: float) -> Optional[float]:
         formula = self.formula_manager.get_formula_by_class(track, vehicle_class, session_type)
         if not formula:
-            b = calculate_b_from_point(1.0, lap_time, DEFAULT_A_VALUE)
-            formula = Formula(track, vehicle_class, DEFAULT_A_VALUE, b, session_type)
+            # For first point, calculate optimal A to hit the center
+            center_ratio = self._min_ratio + ((self._max_ratio - self._min_ratio) / 2)
+            a = (lap_time - MIN_B) * center_ratio
+            a = max(MIN_A, min(MAX_A, a))
+            b = calculate_b_from_point(1.0, lap_time, a)
+            formula = Formula(track, vehicle_class, a, b, session_type)
         
         return formula.get_ratio_for_time(lap_time)
 
@@ -706,6 +939,10 @@ class AutopilotManager:
         self.engine = AutopilotEngine(db, self.formula_manager)
         self.enabled = False
         self.user_laptimes_manager = None
+    
+    def set_ratio_limits(self, min_ratio: float, max_ratio: float):
+        """Set ratio limits for A optimization"""
+        self.engine.set_ratio_limits(min_ratio, max_ratio)
     
     def set_user_laptimes_manager(self, manager: UserLapTimesManager):
         self.user_laptimes_manager = manager
@@ -738,3 +975,19 @@ class AutopilotManager:
         if self.user_laptimes_manager:
             return self.user_laptimes_manager.get_laptimes_for_combo(track, vehicle_class, session_type)
         return []
+    
+    def lock_formula(self, track: str, vehicle_class: str, session_type: str, reason: str = "") -> bool:
+        """Lock a formula to prevent auto-updates"""
+        return self.formula_manager.lock_formula(track, vehicle_class, session_type, reason)
+    
+    def unlock_formula(self, track: str, vehicle_class: str, session_type: str) -> bool:
+        """Unlock a formula to allow auto-updates"""
+        return self.formula_manager.unlock_formula(track, vehicle_class, session_type)
+    
+    def is_formula_locked(self, track: str, vehicle_class: str, session_type: str) -> bool:
+        """Check if a formula is locked"""
+        return self.formula_manager.is_formula_locked(track, vehicle_class, session_type)
+    
+    def get_lock_reason(self, track: str, vehicle_class: str, session_type: str) -> str:
+        """Get lock reason for a locked formula"""
+        return self.formula_manager.get_lock_reason(track, vehicle_class, session_type)

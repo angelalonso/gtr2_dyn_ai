@@ -107,6 +107,8 @@ class MainWindowTk:
         self.class_mapping = load_vehicle_classes(vehicle_classes_path)
         
         self.autopilot_manager = AutopilotManager(self.db)
+        # Set ratio limits for A optimization
+        self.autopilot_manager.set_ratio_limits(self.min_ratio, self.max_ratio)
         
         # Initialize user laptimes manager
         max_laptimes = get_nr_last_user_laptimes(config_file)

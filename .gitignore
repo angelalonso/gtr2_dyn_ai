@@ -4,6 +4,8 @@ Pipfile.lock
 __pycache__/**
 track_formulas/**
 logs/**
+simulation_logs/**
+aiw_backups/**
 dyn_ai.exe
 dyn_ai_setup.exe
 dyn_ai_visualizer.exe

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from core_aiw_utils import find_aiw_file_from_path, update_aiw_ratio, ensure_aiw_has_ratios, find_aiw_file_by_track
+from core_track_utils import normalize_track_from_path, extract_track_info_from_race_data
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class RaceData:
     ai_count: int = 0
     ai_results: List[Dict] = field(default_factory=list)
     raw_content: str = ""
+    canonical_track_id: Optional[str] = None
     
     def __post_init__(self):
         if not self.timestamp:
@@ -155,7 +157,6 @@ class DataExtractor:
             
             logger.info(f"[EXTRACTOR] Read {len(content)} bytes from file")
             
-            # Print first few lines for debugging
             lines = content.split('\n')[:10]
             logger.info(f"[EXTRACTOR] File preview:")
             for i, line in enumerate(lines):
@@ -198,10 +199,6 @@ class DataExtractor:
                 logger.info(f"[EXTRACTOR] Scene raw: '{scene}'")
                 scene_path = Path(scene)
                 data.track_folder = scene_path.parent.name
-                track_name = scene_path.stem
-                track_name = re.sub(r'^\d+', '', track_name)
-                data.track_name = track_name
-                logger.info(f"[EXTRACTOR] Track name extracted: {data.track_name} (folder={data.track_folder})")
             
             aiw_match = self.AIDB_PATTERN.search(race_section)
             if aiw_match:
@@ -209,7 +206,17 @@ class DataExtractor:
                 logger.info(f"[EXTRACTOR] AIW path raw: '{aiw_path_str}'")
                 data.aiw_relative_path = aiw_path_str
                 data.aiw_file = Path(aiw_path_str).name
+                
+                # Extract canonical track ID
+                track_info = extract_track_info_from_race_data(
+                    data.aiw_relative_path, 
+                    data.track_folder
+                )
+                data.canonical_track_id = track_info['canonical_id']
+                data.track_name = data.canonical_track_id
+                
                 logger.info(f"[EXTRACTOR] AIW file extracted: {data.aiw_file}")
+                logger.info(f"[EXTRACTOR] Canonical track ID: {data.canonical_track_id}")
         else:
             logger.warning("[EXTRACTOR] No [Race] section found in file")
     
@@ -223,10 +230,8 @@ class DataExtractor:
         logger.info(f"[EXTRACTOR] Resolving AIW path from: {data.aiw_relative_path}")
         logger.info(f"[EXTRACTOR] Base path: {self.base_path}")
         
-        # First try exact path resolution
         aiw_path = find_aiw_file_from_path(data.aiw_relative_path, self.base_path)
         
-        # If not found, try by track name (fallback)
         if not aiw_path or not aiw_path.exists():
             logger.info(f"[EXTRACTOR] Exact path resolution failed, trying by track name: {data.track_name}")
             if data.track_name:

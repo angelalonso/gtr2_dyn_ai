@@ -23,6 +23,7 @@ echo "Copying files to ${COMPILEDIR}..."
 cp core_config.py ${COMPILEDIR}/
 cp core_database.py ${COMPILEDIR}/
 cp core_log_manager.py ${COMPILEDIR}/
+cp core_track_utils.py ${COMPILEDIR}/
 cp core_vehicle_scanner.py ${COMPILEDIR}/
 cp gui_setup_cfg.py ${COMPILEDIR}/
 cp gui_setup_backup.py ${COMPILEDIR}/
@@ -31,6 +32,7 @@ cp gui_datamgmt_laptimes.py ${COMPILEDIR}/
 cp gui_datamgmt_vehicle.py ${COMPILEDIR}/
 cp gui_setup_logs.py ${COMPILEDIR}/
 cp gui_pre_run_check.py ${COMPILEDIR}/
+cp gui_setup_tracks.py ${COMPILEDIR}/
 cp dyn_ai_setup.py ${COMPILEDIR}/
 
 cd ${COMPILEDIR}
@@ -64,6 +66,7 @@ wine python -m PyInstaller \
     --hidden-import=core_config \
     --hidden-import=core_database \
     --hidden-import=core_log_manager \
+    --hidden-import=core_track_utils \
     --hidden-import=core_vehicle_scanner \
     --hidden-import=gui_setup_cfg \
     --hidden-import=gui_setup_backup \
@@ -71,6 +74,7 @@ wine python -m PyInstaller \
     --hidden-import=gui_datamgmt_laptimes \
     --hidden-import=gui_datamgmt_vehicle \
     --hidden-import=gui_setup_logs \
+    --hidden-import=gui_setup_tracks \
     --hidden-import=gui_pre_run_check \
     dyn_ai_setup.py
 

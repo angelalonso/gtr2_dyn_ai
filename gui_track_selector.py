@@ -30,7 +30,7 @@ class TrackSelectorDialog:
         self.filtered_tracks = []
     
     def show(self) -> Optional[str]:
-        """Show the dialog and return the selected track name"""
+        """Show the dialog and return the selected track canonical ID"""
         self.dialog = tk.Toplevel(self.parent)
         self.dialog.title("Select Track")
         self.dialog.geometry("450x400")

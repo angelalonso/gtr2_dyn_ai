@@ -4,8 +4,6 @@
 
 - If you update the Ratio through the visualizer, the main dyn_ai does not get updated (but the file does).
 
-- The track selection on dyn_ai and dyn_ai_visualizer does not use the same list.
-
 - The import area is not stable enough; it has been barely tested.
 
 - Sometimes the visualizer does not show current data and needs the "Refresh" button to be pushed.

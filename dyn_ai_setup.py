@@ -39,6 +39,7 @@ class SetupManager(tk.Tk):
         
         self.config_tab = None
         self.vehicle_tab = None
+        self.track_tab = None
         
         self.setup_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -71,6 +72,10 @@ class SetupManager(tk.Tk):
         # Configuration tab
         self.config_tab = self.create_config_tab()
         self.notebook.add(self.config_tab, text="Configuration")
+        
+        # Track Names Management tab
+        self.track_tab = self.create_track_tab()
+        self.notebook.add(self.track_tab, text="Track Names")
         
         # Laptimes and Ratios tab (from data manager)
         self.laptimes_tab = self.create_laptimes_tab()
@@ -128,6 +133,11 @@ class SetupManager(tk.Tk):
         """Create the logs tab"""
         from gui_setup_logs import LogsTab
         return LogsTab(self)
+    
+    def create_track_tab(self) -> tk.Frame:
+        """Create the track names management tab"""
+        from gui_setup_tracks import TrackManagementTab
+        return TrackManagementTab(self, self.db_path)
     
     def run(self):
         logger.info("Setup Manager UI started")

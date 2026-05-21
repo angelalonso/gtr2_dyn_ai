@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from core_aiw_utils import find_aiw_file_from_path, update_aiw_ratio, ensure_aiw_has_ratios, find_aiw_file_by_track
+from core_track_utils import normalize_track_from_path, normalize_track_from_name, extract_track_info_from_race_data
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,9 @@ class RaceData:
     ai_count: int = 0
     ai_results: List[Dict] = field(default_factory=list)
     raw_content: str = ""
+    canonical_track_id: Optional[str] = None
+    track_display_name: Optional[str] = None
+    aiw_stem: Optional[str] = None
     
     def __post_init__(self):
         if not self.timestamp:
@@ -198,10 +202,11 @@ class DataExtractor:
                 logger.info(f"[EXTRACTOR] Scene raw: '{scene}'")
                 scene_path = Path(scene)
                 data.track_folder = scene_path.parent.name
-                track_name = scene_path.stem
-                track_name = re.sub(r'^\d+', '', track_name)
-                data.track_name = track_name
-                logger.info(f"[EXTRACTOR] Track name extracted: {data.track_name} (folder={data.track_folder})")
+                data.aiw_stem = scene_path.stem
+                # For backward compatibility, keep track_name as display name
+                data.track_display_name = normalize_track_from_name(data.aiw_stem)
+                data.track_name = data.track_display_name
+                logger.info(f"[EXTRACTOR] Track name extracted: {data.track_name} (folder={data.track_folder}, stem={data.aiw_stem})")
             
             aiw_match = self.AIDB_PATTERN.search(race_section)
             if aiw_match:
@@ -209,7 +214,20 @@ class DataExtractor:
                 logger.info(f"[EXTRACTOR] AIW path raw: '{aiw_path_str}'")
                 data.aiw_relative_path = aiw_path_str
                 data.aiw_file = Path(aiw_path_str).name
+                
+                # Extract canonical track ID
+                track_info = extract_track_info_from_race_data(
+                    data.aiw_relative_path, 
+                    data.track_name, 
+                    data.track_folder
+                )
+                data.canonical_track_id = track_info['canonical_id']
+                data.track_display_name = track_info['display_name']
+                # Override track_name with canonical ID for DB storage
+                data.track_name = data.canonical_track_id if data.canonical_track_id else data.track_name
+                
                 logger.info(f"[EXTRACTOR] AIW file extracted: {data.aiw_file}")
+                logger.info(f"[EXTRACTOR] Canonical track ID: {data.canonical_track_id}")
         else:
             logger.warning("[EXTRACTOR] No [Race] section found in file")
     

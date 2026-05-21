@@ -29,6 +29,7 @@ from core_config import (
 )
 from core_data_extraction import RaceData
 from core_autopilot import AutopilotManager, get_vehicle_class, load_vehicle_classes
+from core_track_utils import get_display_name_from_canonical
 from core_user_laptimes import UserLapTimesManager
 from gui_base_path_dialog import BasePathSelectionDialog
 from gui_file_monitor import FileMonitorDaemon
@@ -358,8 +359,10 @@ class MainWindowTk:
         if selected_track:
             logger.info(f"Manually selected track: {selected_track}")
             self.current_track = selected_track
-            self.track_label.config(text=selected_track)
-            self.root.title(f"GTR2 Dynamic AI - {self.current_track}")
+            # Display the friendly name, but store the canonical ID
+            display_name = get_display_name_from_canonical(selected_track)
+            self.track_label.config(text=display_name)
+            self.root.title(f"GTR2 Dynamic AI - {display_name}")
             
             # Verify AIW file exists
             from core_track_scanner import find_aiw_file_for_track
@@ -378,7 +381,8 @@ class MainWindowTk:
             self.update_display()
             self.load_aiw_ratios()
             
-            self._update_status_safe(f"Track selected: {selected_track}")
+            self._update_status_safe(f"Track selected: {display_name}")
+
     
     def get_ai_times_for_track(self, track: str, session_type: str) -> Tuple[Optional[float], Optional[float]]:
         """Get best and worst AI times for a track"""
@@ -874,9 +878,13 @@ class MainWindowTk:
     
     # Helper methods for thread-safe UI updates
     def _update_track(self, track_name):
+        """Thread-safe method to update track display from background thread"""
+        from core_track_utils import get_display_name_from_canonical
+        
         self.current_track = track_name
-        self.track_label.config(text=track_name)
-        self.root.title(f"GTR2 Dynamic AI - {track_name}")
+        display_name = get_display_name_from_canonical(track_name)
+        self.track_label.config(text=display_name)
+        self.root.title(f"GTR2 Dynamic AI - {display_name}")
     
     def _update_user_qualifying(self, time_sec):
         self.user_qualifying_sec = time_sec

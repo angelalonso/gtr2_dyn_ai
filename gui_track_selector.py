@@ -11,7 +11,6 @@ from typing import Optional, List
 import logging
 
 from core_track_scanner import get_available_tracks
-from core_track_utils import get_display_name_from_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,7 @@ class TrackSelectorDialog:
         self.dialog = None
         self.track_listbox = None
         self.search_var = None
-        self.tracks = []  # List of (canonical_id, display_name)
+        self.tracks = []
         self.filtered_tracks = []
     
     def show(self) -> Optional[str]:
@@ -99,17 +98,11 @@ class TrackSelectorDialog:
             self.status_label.config(text="Base path not configured", fg='#f44336')
             return
         
-        raw_tracks = get_available_tracks(self.base_path, self.db_path)
+        self.tracks = get_available_tracks(self.base_path, self.db_path)
         
-        if not raw_tracks:
+        if not self.tracks:
             self.status_label.config(text="No tracks found", fg='#f44336')
             return
-        
-        # Convert to (canonical_id, display_name) pairs
-        self.tracks = []
-        for track in raw_tracks:
-            display_name = get_display_name_from_canonical(track)
-            self.tracks.append((track, display_name))
         
         self.filtered_tracks = self.tracks.copy()
         self.update_listbox()
@@ -119,7 +112,7 @@ class TrackSelectorDialog:
         """Filter tracks based on search text"""
         search_text = self.search_var.get().lower()
         if search_text:
-            self.filtered_tracks = [t for t in self.tracks if search_text in t[0].lower() or search_text in t[1].lower()]
+            self.filtered_tracks = [t for t in self.tracks if search_text in t.lower()]
         else:
             self.filtered_tracks = self.tracks.copy()
         self.update_listbox()
@@ -127,9 +120,8 @@ class TrackSelectorDialog:
     def update_listbox(self):
         """Update the listbox with filtered tracks"""
         self.track_listbox.delete(0, tk.END)
-        for canonical_id, display_name in self.filtered_tracks:
-            # Show display name, store canonical ID as data
-            self.track_listbox.insert(tk.END, display_name)
+        for track in self.filtered_tracks:
+            self.track_listbox.insert(tk.END, track)
         
         if not self.filtered_tracks:
             self.track_listbox.insert(tk.END, "No tracks found")
@@ -143,8 +135,7 @@ class TrackSelectorDialog:
         if selection and self.filtered_tracks:
             idx = selection[0]
             if idx < len(self.filtered_tracks):
-                # Return the canonical ID, not the display name
-                self.selected_track = self.filtered_tracks[idx][0]
+                self.selected_track = self.filtered_tracks[idx]
                 self.dialog.destroy()
     
     def cancel(self):

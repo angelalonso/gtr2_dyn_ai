@@ -29,6 +29,7 @@ cp core_database.py ${COMPILEDIR}/
 cp core_log_manager.py ${COMPILEDIR}/
 cp core_math.py ${COMPILEDIR}/
 cp core_track_scanner.py ${COMPILEDIR}/
+cp core_track_utils.py ${COMPILEDIR}/
 cp core_user_laptimes.py ${COMPILEDIR}/
 cp core_vehicle_scanner.py ${COMPILEDIR}/
 cp gui_base_path_dialog.py ${COMPILEDIR}/
@@ -93,6 +94,7 @@ wine python -m PyInstaller \
     --hidden-import=core_log_manager \
     --hidden-import=core_math \
     --hidden-import=core_track_scanner \
+    --hidden-import=core_track_utils \
     --hidden-import=core_user_laptimes \
     --hidden-import=core_vehicle_scanner \
     --hidden-import=gui_base_path_dialog \

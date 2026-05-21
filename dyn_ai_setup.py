@@ -77,13 +77,13 @@ class SetupManager(tk.Tk):
         self.track_tab = self.create_track_tab()
         self.notebook.add(self.track_tab, text="Track Names")
         
-        # Laptimes and Ratios tab (from data manager)
-        self.laptimes_tab = self.create_laptimes_tab()
-        self.notebook.add(self.laptimes_tab, text="Laptimes and Ratios")
-        
         # Vehicle Classes tab (from data manager)
         self.vehicle_tab = self.create_vehicle_tab()
         self.notebook.add(self.vehicle_tab, text="Vehicle Classes")
+        
+        # Laptimes and Ratios tab (from data manager)
+        self.laptimes_tab = self.create_laptimes_tab()
+        self.notebook.add(self.laptimes_tab, text="Laptimes and Ratios")
         
         # Race Data Import tab (from data manager)
         self.import_tab = self.create_import_tab()

@@ -29,7 +29,6 @@ from core_config import (
 )
 from core_data_extraction import RaceData
 from core_autopilot import AutopilotManager, get_vehicle_class, load_vehicle_classes
-from core_track_utils import get_display_name_from_canonical
 from core_user_laptimes import UserLapTimesManager
 from gui_base_path_dialog import BasePathSelectionDialog
 from gui_file_monitor import FileMonitorDaemon
@@ -359,10 +358,8 @@ class MainWindowTk:
         if selected_track:
             logger.info(f"Manually selected track: {selected_track}")
             self.current_track = selected_track
-            # Display the friendly name, but store the canonical ID
-            display_name = get_display_name_from_canonical(selected_track)
-            self.track_label.config(text=display_name)
-            self.root.title(f"GTR2 Dynamic AI - {display_name}")
+            self.track_label.config(text=selected_track)
+            self.root.title(f"GTR2 Dynamic AI - {selected_track}")
             
             # Verify AIW file exists
             from core_track_scanner import find_aiw_file_for_track
@@ -381,8 +378,7 @@ class MainWindowTk:
             self.update_display()
             self.load_aiw_ratios()
             
-            self._update_status_safe(f"Track selected: {display_name}")
-
+            self._update_status_safe(f"Track selected: {selected_track}")
     
     def get_ai_times_for_track(self, track: str, session_type: str) -> Tuple[Optional[float], Optional[float]]:
         """Get best and worst AI times for a track"""
@@ -746,6 +742,13 @@ class MainWindowTk:
         user_vehicle = race_data.user_vehicle
         aiw_path = race_data.aiw_path
         ai_results = race_data.ai_results
+        
+        # Determine vehicle class from user vehicle
+        vehicle_class_for_autopilot = ""
+        if user_vehicle:
+            vehicle_class_for_autopilot = get_vehicle_class(user_vehicle, self.class_mapping)
+            self.root.after(0, lambda: self._update_user_vehicle_class(user_vehicle, vehicle_class_for_autopilot))
+        
         current_track_ref = self.current_track
         current_vehicle_class_ref = self.current_vehicle_class
         
@@ -777,9 +780,6 @@ class MainWindowTk:
         if worst_ai:
             self.root.after(0, lambda: self._update_race_worst_ai(worst_ai))
         
-        if user_vehicle:
-            self.root.after(0, lambda: self._update_user_vehicle(user_vehicle))
-        
         # Save race session to database (database operations are thread-safe)
         race_dict = race_data.to_dict()
         race_id = self.db.save_race_session(race_dict)
@@ -806,69 +806,77 @@ class MainWindowTk:
         
         self.root.after(0, lambda: self._reload_and_update())
         
-        # Auto-ratio update if enabled - use thread-safe GUI updates
+        # Auto-ratio update if enabled
         if self.autoratio_enabled and aiw_path:
             logger.info("[MAIN] Auto-ratio is enabled, calculating new ratios")
             
-            # Capture current values for use in closure
-            last_qual = self.last_qual_ratio
-            last_race = self.last_race_ratio
+            # Use the vehicle class we determined from the race data
+            if not vehicle_class_for_autopilot and current_vehicle_class_ref:
+                vehicle_class_for_autopilot = current_vehicle_class_ref
             
-            if last_qual is not None:
-                self.root.after(0, lambda: self._set_qual_previous_ratio(last_qual))
-            
-            if last_race is not None:
-                self.root.after(0, lambda: self._set_race_previous_ratio(last_race))
-            
-            if user_qualifying_sec > 0:
-                self.user_laptimes_manager.add_laptime(
-                    current_track_ref, current_vehicle_class_ref, "qual",
-                    user_qualifying_sec, last_qual
-                )
-                median_time = self.user_laptimes_manager.get_median_laptime_for_combo(
-                    current_track_ref, current_vehicle_class_ref, "qual"
-                )
-                effective_time = median_time if median_time is not None else user_qualifying_sec
+            if not vehicle_class_for_autopilot:
+                logger.warning("[MAIN] Cannot calculate auto-ratio: no vehicle class available")
+            else:
+                last_qual = self.last_qual_ratio
+                last_race = self.last_race_ratio
                 
-                new_qual_ratio_val = ratio_from_time(effective_time, DEFAULT_A_VALUE, self.qual_b)
-                if new_qual_ratio_val and abs(new_qual_ratio_val - last_qual) > 0.000001:
-                    clamped = clamp_ratio(new_qual_ratio_val, self.min_ratio, self.max_ratio)
-                    ratio_adjusted = (clamped != new_qual_ratio_val)
-                    
-                    if update_aiw_ratio(aiw_path, "QualRatio", clamped, self.backup_dir):
-                        self.root.after(0, lambda: self._update_qual_ratio(clamped))
-                        self.root.after(0, lambda: self._enable_qual_revert())
-                        
-                        if ratio_adjusted:
-                            self._show_warning_safe("QualRatio Adjusted",
-                                f"The calculated QualRatio = {new_qual_ratio_val:.6f} was outside the allowed range "
-                                f"({self.min_ratio:.3f} - {self.max_ratio:.3f}).\n\n"
-                                f"The ratio has been clamped to {clamped:.6f}.")
-            
-            if user_best_lap_sec > 0:
-                self.user_laptimes_manager.add_laptime(
-                    current_track_ref, current_vehicle_class_ref, "race",
-                    user_best_lap_sec, last_race
-                )
-                median_time = self.user_laptimes_manager.get_median_laptime_for_combo(
-                    current_track_ref, current_vehicle_class_ref, "race"
-                )
-                effective_time = median_time if median_time is not None else user_best_lap_sec
+                if last_qual is not None:
+                    self.root.after(0, lambda: self._set_qual_previous_ratio(last_qual))
                 
-                new_race_ratio_val = ratio_from_time(effective_time, DEFAULT_A_VALUE, self.race_b)
-                if new_race_ratio_val and abs(new_race_ratio_val - last_race) > 0.000001:
-                    clamped = clamp_ratio(new_race_ratio_val, self.min_ratio, self.max_ratio)
-                    ratio_adjusted = (clamped != new_race_ratio_val)
+                if last_race is not None:
+                    self.root.after(0, lambda: self._set_race_previous_ratio(last_race))
+                
+                # Qualifying auto-ratio
+                if user_qualifying_sec > 0 and track_name and vehicle_class_for_autopilot:
+                    self.user_laptimes_manager.add_laptime(
+                        track_name, vehicle_class_for_autopilot, "qual",
+                        user_qualifying_sec, last_qual if last_qual is not None else 1.0
+                    )
+                    median_time = self.user_laptimes_manager.get_median_laptime_for_combo(
+                        track_name, vehicle_class_for_autopilot, "qual"
+                    )
+                    effective_time = median_time if median_time is not None else user_qualifying_sec
                     
-                    if update_aiw_ratio(aiw_path, "RaceRatio", clamped, self.backup_dir):
-                        self.root.after(0, lambda: self._update_race_ratio(clamped))
-                        self.root.after(0, lambda: self._enable_race_revert())
+                    new_qual_ratio_val = ratio_from_time(effective_time, DEFAULT_A_VALUE, self.qual_b)
+                    if new_qual_ratio_val and (last_qual is None or abs(new_qual_ratio_val - last_qual) > 0.000001):
+                        clamped = clamp_ratio(new_qual_ratio_val, self.min_ratio, self.max_ratio)
+                        ratio_adjusted = (clamped != new_qual_ratio_val)
                         
-                        if ratio_adjusted:
-                            self._show_warning_safe("RaceRatio Adjusted",
-                                f"The calculated RaceRatio = {new_race_ratio_val:.6f} was outside the allowed range "
-                                f"({self.min_ratio:.3f} - {self.max_ratio:.3f}).\n\n"
-                                f"The ratio has been clamped to {clamped:.6f}.")
+                        if update_aiw_ratio(aiw_path, "QualRatio", clamped, self.backup_dir):
+                            self.root.after(0, lambda: self._update_qual_ratio(clamped))
+                            self.root.after(0, lambda: self._enable_qual_revert())
+                            
+                            if ratio_adjusted:
+                                self._show_warning_safe("QualRatio Adjusted",
+                                    f"The calculated QualRatio = {new_qual_ratio_val:.6f} was outside the allowed range "
+                                    f"({self.min_ratio:.3f} - {self.max_ratio:.3f}).\n\n"
+                                    f"The ratio has been clamped to {clamped:.6f}.")
+                
+                # Race auto-ratio
+                if user_best_lap_sec > 0 and track_name and vehicle_class_for_autopilot:
+                    self.user_laptimes_manager.add_laptime(
+                        track_name, vehicle_class_for_autopilot, "race",
+                        user_best_lap_sec, last_race if last_race is not None else 1.0
+                    )
+                    median_time = self.user_laptimes_manager.get_median_laptime_for_combo(
+                        track_name, vehicle_class_for_autopilot, "race"
+                    )
+                    effective_time = median_time if median_time is not None else user_best_lap_sec
+                    
+                    new_race_ratio_val = ratio_from_time(effective_time, DEFAULT_A_VALUE, self.race_b)
+                    if new_race_ratio_val and (last_race is None or abs(new_race_ratio_val - last_race) > 0.000001):
+                        clamped = clamp_ratio(new_race_ratio_val, self.min_ratio, self.max_ratio)
+                        ratio_adjusted = (clamped != new_race_ratio_val)
+                        
+                        if update_aiw_ratio(aiw_path, "RaceRatio", clamped, self.backup_dir):
+                            self.root.after(0, lambda: self._update_race_ratio(clamped))
+                            self.root.after(0, lambda: self._enable_race_revert())
+                            
+                            if ratio_adjusted:
+                                self._show_warning_safe("RaceRatio Adjusted",
+                                    f"The calculated RaceRatio = {new_race_ratio_val:.6f} was outside the allowed range "
+                                    f"({self.min_ratio:.3f} - {self.max_ratio:.3f}).\n\n"
+                                    f"The ratio has been clamped to {clamped:.6f}.")
         
         self.root.after(0, lambda: self._reload_and_update())
         
@@ -878,13 +886,9 @@ class MainWindowTk:
     
     # Helper methods for thread-safe UI updates
     def _update_track(self, track_name):
-        """Thread-safe method to update track display from background thread"""
-        from core_track_utils import get_display_name_from_canonical
-        
         self.current_track = track_name
-        display_name = get_display_name_from_canonical(track_name)
-        self.track_label.config(text=display_name)
-        self.root.title(f"GTR2 Dynamic AI - {display_name}")
+        self.track_label.config(text=track_name)
+        self.root.title(f"GTR2 Dynamic AI - {track_name}")
     
     def _update_user_qualifying(self, time_sec):
         self.user_qualifying_sec = time_sec
@@ -924,10 +928,12 @@ class MainWindowTk:
     def _update_race_worst_ai(self, worst):
         self.race_worst_ai = worst
     
-    def _update_user_vehicle(self, vehicle):
-        self.current_vehicle = vehicle
-        self.current_vehicle_class = get_vehicle_class(vehicle, self.class_mapping)
-        self.car_class_label.config(text=self.current_vehicle_class)
+    def _update_user_vehicle_class(self, vehicle_name: str, vehicle_class: str):
+        """Thread-safe method to update user vehicle and class"""
+        self.current_vehicle = vehicle_name
+        self.current_vehicle_class = vehicle_class
+        self.car_class_label.config(text=vehicle_class if vehicle_class else "Unknown")
+        logger.info(f"[MAIN] Updated vehicle class: {vehicle_name} -> {vehicle_class}")
     
     def _set_qual_previous_ratio(self, ratio):
         if self.qual_panel:

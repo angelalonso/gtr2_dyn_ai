@@ -27,3 +27,11 @@ Usable, stable release with fewer requirements.
 - If you want to understand how the Ratios are calculated, you can check the data using dyn_ai_visualizer.
   - Moreover, here you can manually change the formulas, the latest User Laptime, select multiple points, and delete data points from the database. Use with caution.
 - If you want to correct a Ratio by hand, turn off the "Auto-calculate Ratios" and click on "Edit".
+
+## IMPORTANT
+
+PLEASE NOTE: I stopped all development to this application. It works well enough and life just goes on.
+
+Feel free to modify it to your liking, or solve some of the tasks in TODO.md, though. 
+
+I may even help you navigate the code if you put the effort.

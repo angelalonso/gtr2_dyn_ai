@@ -363,6 +363,9 @@ class FormulaVisualizer(QMainWindow):
         self.qual_panel.lock_toggled.connect(self.on_lock_toggled)
         self.race_panel.lock_toggled.connect(self.on_lock_toggled)
         
+        # Connect points_deleted signal
+        self.curve_graph.points_deleted.connect(self.on_points_deleted)
+        
         # Load initial data after UI is ready
         self.selector.load_data()
         # Trigger initial selection after a short delay to ensure UI is fully initialized
@@ -674,6 +677,22 @@ class FormulaVisualizer(QMainWindow):
                 title += f" [{' | '.join(formulas)}]"
         self.setWindowTitle(title)
 
+    def on_points_deleted(self, deleted_points):
+        """Handle points_deleted signal from the graph"""
+        logger.info(f"Points deleted: {len(deleted_points)} point(s)")
+        
+        # Refresh formulas after points are deleted
+        self.autopilot_manager.reload_formulas()
+        
+        # Reload current data and update display
+        self.load_current_data()
+        self.update_all_display()
+        
+        # Force graph to refresh
+        if self.curve_graph:
+            self.curve_graph.load_data()
+            self.curve_graph.full_refresh()
+
     # ------------------------------------------------------------------
     # Formula locking
     # ------------------------------------------------------------------
@@ -777,7 +796,7 @@ class FormulaVisualizer(QMainWindow):
         info_layout.setContentsMargins(10, 5, 10, 5)
         
         info_layout.addWidget(QLabel("Selected Data Point:"))
-        self.info_text = QLabel("Click on any data point to see its ratio and lap time")
+        self.info_text = QLabel("Click on any data point to see its ratio and lap time. Ctrl+Click to select multiple. Right-click for delete options.")
         self.info_text.setStyleSheet("color: #4CAF50; font-family: monospace;")
         self.info_text.setWordWrap(True)
         info_layout.addWidget(self.info_text, stretch=1)

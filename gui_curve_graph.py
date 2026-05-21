@@ -10,9 +10,9 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QMessageBox, QListWidget, QListWidgetItem, QAbstractItemView,
-    QDialog, QDialogButtonBox
+    QDialog, QDialogButtonBox, QMenu, QAction, QApplication
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QPoint
 
 from core_math import DEFAULT_A_VALUE, time_from_ratio, ratio_from_time, get_formula_string
 from core_autopilot import get_vehicle_class, load_vehicle_classes
@@ -24,6 +24,7 @@ class CurveGraphWidget(QWidget):
     point_selected = pyqtSignal(str, str, float, float)
     data_updated = pyqtSignal()
     formula_changed = pyqtSignal(str, float, float)
+    points_deleted = pyqtSignal(list)  # Emitted when points are deleted, passes list of (id, session_type)
     
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -59,6 +60,11 @@ class CurveGraphWidget(QWidget):
         self.median_qual_ratio = None
         self.median_race_ratio = None
         
+        # Store data points with their IDs for deletion
+        self.qual_points_data = []  # list of (id, ratio, lap_time)
+        self.race_points_data = []  # list of (id, ratio, lap_time)
+        self.unknown_points_data = []  # list of (id, ratio, lap_time)
+        
         self.qual_curve = None
         self.race_curve = None
         self.qual_scatter = None
@@ -71,16 +77,371 @@ class CurveGraphWidget(QWidget):
         self.median_qual_point = None
         self.median_race_point = None
         self.legend = None
-        self.selected_point_marker = None
-        self.user_point_labels = []
-        self.user_v_lines = []
+        self.selected_point_markers = []  # List of selected point markers
+        self.selected_point_ids = set()  # Set of selected point IDs
+        self.user_point_labels = []  # List of text labels for user points
+        self.user_v_lines = []  # List of vertical/horizontal lines for user points
+        
+        # Selection mode state
+        self.selection_mode = False
+        self.selection_rect = None
+        self.selection_start = None
+        self.selection_rect_item = None
+        self.last_click_pos = None
         
         self.setup_ui()
+        self.setup_context_menu()
         
+    def setup_context_menu(self):
+        """Setup right-click context menu for the plot"""
+        # Set context menu policy on the plot widget itself
+        self.plot_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.plot_widget.customContextMenuRequested.connect(self.show_context_menu)
+        
+        self.context_menu = QMenu(self)
+        
+        self.delete_selected_action = QAction("Delete Selected Points", self)
+        self.delete_selected_action.triggered.connect(self.delete_selected_points)
+        self.context_menu.addAction(self.delete_selected_action)
+        
+        self.select_all_action = QAction("Select All Points", self)
+        self.select_all_action.triggered.connect(self.select_all_points)
+        self.context_menu.addAction(self.select_all_action)
+        
+        self.clear_selection_action = QAction("Clear Selection", self)
+        self.clear_selection_action.triggered.connect(self.clear_selection)
+        self.context_menu.addAction(self.clear_selection_action)
+        
+        self.context_menu.addSeparator()
+        
+        self.selection_mode_action = QAction("Enable Selection Mode (Click to select)", self)
+        self.selection_mode_action.setCheckable(True)
+        self.selection_mode_action.triggered.connect(self.toggle_selection_mode)
+        self.context_menu.addAction(self.selection_mode_action)
+        
+        self.context_menu.addSeparator()
+        
+        self.delete_qual_action = QAction("Delete All Qualifying Points", self)
+        self.delete_qual_action.triggered.connect(lambda: self.delete_all_points_for_session("qual"))
+        self.context_menu.addAction(self.delete_qual_action)
+        
+        self.delete_race_action = QAction("Delete All Race Points", self)
+        self.delete_race_action.triggered.connect(lambda: self.delete_all_points_for_session("race"))
+        self.context_menu.addAction(self.delete_race_action)
+        
+    def show_context_menu(self, pos):
+        """Show the context menu at the given position"""
+        # Convert position to global coordinates
+        global_pos = self.plot_widget.mapToGlobal(pos)
+        self.context_menu.exec_(global_pos)
+    
+    def toggle_selection_mode(self, enabled):
+        """Toggle selection mode on/off"""
+        self.selection_mode = enabled
+        if enabled:
+            self.selection_mode_action.setText("Disable Selection Mode")
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.selection_mode_action.setText("Enable Selection Mode (Click to select)")
+            self.setCursor(Qt.ArrowCursor)
+            self.clear_selection()
+    
+    def get_all_data_points_with_ids(self):
+        """Get all data points with their IDs for the current track and selected classes"""
+        if not self.current_track or not self.selected_classes:
+            return [], [], []
+        
+        vehicle_classes = self._get_vehicles_for_classes(self.selected_classes)
+        if not vehicle_classes:
+            return [], [], []
+        
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(vehicle_classes))
+        
+        query = f"""
+            SELECT id, ratio, lap_time, session_type 
+            FROM data_points 
+            WHERE track = ? AND vehicle_class IN ({placeholders})
+        """
+        cursor.execute(query, [self.current_track] + vehicle_classes)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        qual_points = []
+        race_points = []
+        unknown_points = []
+        
+        for row in rows:
+            point_id = row[0]
+            ratio = row[1]
+            lap_time = row[2]
+            session_type = row[3]
+            
+            if session_type == 'qual':
+                qual_points.append((point_id, ratio, lap_time))
+            elif session_type == 'race':
+                race_points.append((point_id, ratio, lap_time))
+            else:
+                unknown_points.append((point_id, ratio, lap_time))
+        
+        return qual_points, race_points, unknown_points
+    
+    def select_all_points(self):
+        """Select all visible data points on the graph"""
+        self.clear_selection()
+        
+        all_points = []
+        
+        if self.show_qualifying:
+            for point_data in self.qual_points_data:
+                point_id = point_data[0]
+                ratio = point_data[1]
+                lap_time = point_data[2]
+                all_points.append((point_id, ratio, lap_time, 'qual'))
+        
+        if self.show_race:
+            for point_data in self.race_points_data:
+                point_id = point_data[0]
+                ratio = point_data[1]
+                lap_time = point_data[2]
+                all_points.append((point_id, ratio, lap_time, 'race'))
+        
+        if self.show_user_points and self.unknown_points_data:
+            for point_data in self.unknown_points_data:
+                point_id = point_data[0]
+                ratio = point_data[1]
+                lap_time = point_data[2]
+                all_points.append((point_id, ratio, lap_time, 'unknown'))
+        
+        for point_id, ratio, lap_time, session_type in all_points:
+            self.selected_point_ids.add(point_id)
+        
+        self.update_selected_markers()
+        
+        count = len(self.selected_point_ids)
+        if count > 0:
+            parent = self.parent()
+            if hasattr(parent, 'info_text'):
+                parent.info_text.setText(f"Selected {count} point(s). Right-click to delete selected points.")
+    
+    def clear_selection(self):
+        """Clear all point selections"""
+        self.selected_point_ids.clear()
+        self.update_selected_markers()
+        parent = self.parent()
+        if hasattr(parent, 'info_text'):
+            parent.info_text.setText("Selection cleared. Click on any data point to see its details.")
+    
+    def update_selected_markers(self):
+        """Update the visual markers for selected points"""
+        # Remove existing markers
+        for marker in self.selected_point_markers:
+            self._safe_remove_item(marker)
+        self.selected_point_markers.clear()
+        
+        # Add markers for selected points
+        selected_points = []
+        
+        # Collect selected points from all categories
+        for point_data in self.qual_points_data:
+            if point_data[0] in self.selected_point_ids:
+                selected_points.append((point_data[1], point_data[2], '#00FF00'))
+        
+        for point_data in self.race_points_data:
+            if point_data[0] in self.selected_point_ids:
+                selected_points.append((point_data[1], point_data[2], '#00FF00'))
+        
+        for point_data in self.unknown_points_data:
+            if point_data[0] in self.selected_point_ids:
+                selected_points.append((point_data[1], point_data[2], '#00FF00'))
+        
+        # Create markers for selected points
+        if selected_points:
+            ratios = [p[0] for p in selected_points]
+            times = [p[1] for p in selected_points]
+            marker = pg.ScatterPlotItem(ratios, times, brush=pg.mkBrush('#00FF00'), 
+                                         size=14, symbol='o', pen=pg.mkPen('white', width=2))
+            self.plot.addItem(marker)
+            self.selected_point_markers.append(marker)
+    
+    def delete_selected_points(self):
+        """Delete all selected points from the database and graph"""
+        if not self.selected_point_ids:
+            QMessageBox.warning(self, "No Selection", 
+                "No points selected. Right-click and use 'Select All Points' or click points while in selection mode.")
+            return
+        
+        point_ids = list(self.selected_point_ids)
+        
+        reply = QMessageBox.question(self, "Confirm Delete",
+            f"Delete {len(point_ids)} selected data point(s)?\n\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        
+        deleted_count = 0
+        failed_count = 0
+        
+        try:
+            for point_id in point_ids:
+                try:
+                    # Delete the data point
+                    cursor.execute("DELETE FROM data_points WHERE id = ?", (point_id,))
+                    if cursor.rowcount > 0:
+                        deleted_count += 1
+                    else:
+                        failed_count += 1
+                except sqlite3.IntegrityError as e:
+                    # Foreign key constraint - inform user
+                    failed_count += 1
+                    QMessageBox.warning(self, "Cannot Delete",
+                        f"Point ID {point_id} is referenced by other data and cannot be deleted.\n\nError: {str(e)}")
+            
+            conn.commit()
+            
+            if deleted_count > 0:
+                QMessageBox.information(self, "Deletion Complete",
+                    f"Successfully deleted {deleted_count} data point(s).\nFailed: {failed_count}")
+                
+                # Clear selection
+                self.selected_point_ids.clear()
+                self.update_selected_markers()
+                
+                # Emit signal that points were deleted
+                deleted_info = []
+                for point_id in point_ids:
+                    if point_id in [p[0] for p in self.qual_points_data]:
+                        deleted_info.append((point_id, 'qual'))
+                    elif point_id in [p[0] for p in self.race_points_data]:
+                        deleted_info.append((point_id, 'race'))
+                self.points_deleted.emit(deleted_info)
+                
+                # Refresh data and graph
+                self.load_data()
+                self.full_refresh()
+                
+                # Notify parent to reload formulas
+                parent = self.parent()
+                if hasattr(parent, 'load_current_data'):
+                    parent.load_current_data()
+                if hasattr(parent, 'update_all_display'):
+                    parent.update_all_display()
+                
+        except Exception as e:
+            conn.rollback()
+            QMessageBox.critical(self, "Error", f"Failed to delete points: {str(e)}")
+        finally:
+            conn.close()
+    
+    def delete_all_points_for_session(self, session_type: str):
+        """Delete all points of a specific session type for the current track and selected classes"""
+        if not self.current_track or not self.selected_classes:
+            QMessageBox.warning(self, "No Track/Class", "Please select a track and vehicle class first.")
+            return
+        
+        vehicle_classes = self._get_vehicles_for_classes(self.selected_classes)
+        if not vehicle_classes:
+            QMessageBox.warning(self, "No Classes", "No vehicle classes selected.")
+            return
+        
+        count = 0
+        if session_type == 'qual':
+            count = len(self.qual_points_data)
+        else:
+            count = len(self.race_points_data)
+        
+        if count == 0:
+            QMessageBox.information(self, "No Points", f"No {session_type.upper()} points to delete for this track/class.")
+            return
+        
+        reply = QMessageBox.question(self, f"Delete All {session_type.upper()} Points",
+            f"Delete all {count} {session_type.upper()} data point(s) for track '{self.current_track}'?\n\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        
+        placeholders = ','.join('?' * len(vehicle_classes))
+        query = f"""
+            DELETE FROM data_points 
+            WHERE track = ? AND vehicle_class IN ({placeholders}) AND session_type = ?
+        """
+        
+        try:
+            cursor.execute(query, [self.current_track] + vehicle_classes + [session_type])
+            deleted_count = cursor.rowcount
+            conn.commit()
+            
+            QMessageBox.information(self, "Deletion Complete",
+                f"Successfully deleted {deleted_count} {session_type.upper()} data point(s).")
+            
+            # Refresh data and graph
+            self.load_data()
+            self.full_refresh()
+            
+            # Notify parent to reload formulas
+            parent = self.parent()
+            if hasattr(parent, 'load_current_data'):
+                parent.load_current_data()
+            if hasattr(parent, 'update_all_display'):
+                parent.update_all_display()
+                
+        except Exception as e:
+            conn.rollback()
+            QMessageBox.critical(self, "Error", f"Failed to delete points: {str(e)}")
+        finally:
+            conn.close()
+    
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
+        # Add toolbar for selection controls
+        toolbar = QFrame()
+        toolbar.setStyleSheet("background-color: #2b2b2b; border-radius: 4px;")
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(8, 4, 8, 4)
+        
+        self.selection_mode_btn = QPushButton("Selection Mode (Off)")
+        self.selection_mode_btn.setCheckable(True)
+        self.selection_mode_btn.setStyleSheet("background-color: #555;")
+        self.selection_mode_btn.clicked.connect(self.toggle_selection_mode_btn)
+        toolbar_layout.addWidget(self.selection_mode_btn)
+        
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self.select_all_points)
+        toolbar_layout.addWidget(self.select_all_btn)
+        
+        self.clear_selection_btn = QPushButton("Clear Selection")
+        self.clear_selection_btn.clicked.connect(self.clear_selection)
+        toolbar_layout.addWidget(self.clear_selection_btn)
+        
+        self.delete_selected_btn = QPushButton("Delete Selected")
+        self.delete_selected_btn.setStyleSheet("background-color: #f44336;")
+        self.delete_selected_btn.clicked.connect(self.delete_selected_points)
+        toolbar_layout.addWidget(self.delete_selected_btn)
+        
+        toolbar_layout.addStretch()
+        
+        self.delete_qual_btn = QPushButton("Delete All Qualifying")
+        self.delete_qual_btn.setStyleSheet("background-color: #f44336;")
+        self.delete_qual_btn.clicked.connect(lambda: self.delete_all_points_for_session("qual"))
+        toolbar_layout.addWidget(self.delete_qual_btn)
+        
+        self.delete_race_btn = QPushButton("Delete All Race")
+        self.delete_race_btn.setStyleSheet("background-color: #f44336;")
+        self.delete_race_btn.clicked.connect(lambda: self.delete_all_points_for_session("race"))
+        toolbar_layout.addWidget(self.delete_race_btn)
+        
+        layout.addWidget(toolbar)
         
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot_widget.setBackground('#2b2b2b')
@@ -95,6 +456,8 @@ class CurveGraphWidget(QWidget):
         self.plot.getAxis('bottom').setTextPen('white')
         self.plot.getAxis('left').setPen('white')
         self.plot.getAxis('left').setTextPen('white')
+        
+        # Connect mouse events for point selection
         self.plot.scene().sigMouseClicked.connect(self.on_plot_click)
         
         layout.addWidget(self.plot_widget)
@@ -105,6 +468,19 @@ class CurveGraphWidget(QWidget):
         info_layout.addWidget(self.formula_label)
         info_layout.addStretch()
         layout.addLayout(info_layout)
+    
+    def toggle_selection_mode_btn(self, checked):
+        """Toggle selection mode from toolbar button"""
+        self.selection_mode = checked
+        if checked:
+            self.selection_mode_btn.setText("Selection Mode (On)")
+            self.selection_mode_btn.setStyleSheet("background-color: #4CAF50;")
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.selection_mode_btn.setText("Selection Mode (Off)")
+            self.selection_mode_btn.setStyleSheet("background-color: #555;")
+            self.setCursor(Qt.ArrowCursor)
+            self.clear_selection()
     
     def set_formula_is_default(self, session_type: str, is_default: bool):
         """Set whether the formula is the default for a session type"""
@@ -291,7 +667,7 @@ class CurveGraphWidget(QWidget):
         cursor = conn.cursor()
         placeholders = ','.join('?' * len(vehicle_classes))
         query = f"""
-            SELECT ratio, lap_time, session_type 
+            SELECT id, ratio, lap_time, session_type 
             FROM data_points 
             WHERE track = ? AND vehicle_class IN ({placeholders})
         """
@@ -299,13 +675,30 @@ class CurveGraphWidget(QWidget):
         rows = cursor.fetchall()
         conn.close()
         result = {'quali': [], 'race': [], 'unknown': []}
-        for ratio, lap_time, session_type in rows:
+        qual_points = []
+        race_points = []
+        unknown_points = []
+        
+        for row in rows:
+            point_id = row[0]
+            ratio = row[1]
+            lap_time = row[2]
+            session_type = row[3]
+            
             if session_type == 'qual':
+                qual_points.append((point_id, ratio, lap_time))
                 result['quali'].append((ratio, lap_time))
             elif session_type == 'race':
+                race_points.append((point_id, ratio, lap_time))
                 result['race'].append((ratio, lap_time))
             else:
+                unknown_points.append((point_id, ratio, lap_time))
                 result['unknown'].append((ratio, lap_time))
+        
+        self.qual_points_data = qual_points
+        self.race_points_data = race_points
+        self.unknown_points_data = unknown_points
+        
         return result
     
     def _safe_remove_legend(self):
@@ -562,6 +955,9 @@ class CurveGraphWidget(QWidget):
                 self.plot.addItem(h_line)
                 self.user_v_lines.append(h_line)
         
+        # Update selected markers after redrawing points
+        self.update_selected_markers()
+        
         self._safe_remove_legend()
         
         self.legend = self.plot.addLegend()
@@ -617,26 +1013,76 @@ class CurveGraphWidget(QWidget):
         self.formula_label.setText(f"{qual_info}{separator}{race_info}{separator2}{median_info}")
     
     def on_plot_click(self, event):
+        """Handle click on the plot for point selection"""
         if self.plot.scene().mouseGrabberItem() is not None:
             return
+        
         pos = event.scenePos()
         mouse_point = self.plot.vb.mapSceneToView(pos)
-        points_data = self.get_selected_data()
+        
+        # Get all points with their IDs
         all_points = []
-        for session in [('quali', '#FFFF00'), ('race', '#FF6600'), ('unknown', '#FF00FF')]:
-            for ratio, lap_time in points_data.get(session[0], []):
-                all_points.append((ratio, lap_time, session[0]))
+        for point_data in self.qual_points_data:
+            point_id, ratio, lap_time = point_data
+            all_points.append((point_id, ratio, lap_time, 'qual'))
+        
+        for point_data in self.race_points_data:
+            point_id, ratio, lap_time = point_data
+            all_points.append((point_id, ratio, lap_time, 'race'))
+        
+        for point_data in self.unknown_points_data:
+            point_id, ratio, lap_time = point_data
+            all_points.append((point_id, ratio, lap_time, 'unknown'))
+        
         if not all_points:
             return
-        closest = min(all_points, key=lambda p: ((p[0] - mouse_point.x())**2 + (p[1] - mouse_point.y())**2))
-        ratio, lap_time, session = closest
         
-        if self.selected_point_marker:
-            self._safe_remove_item(self.selected_point_marker)
+        # Find the closest point within distance threshold
+        min_dist = float('inf')
+        closest_point = None
+        threshold = 0.05  # Ratio distance threshold
         
-        self.selected_point_marker = pg.ScatterPlotItem([ratio], [lap_time], brush=pg.mkBrush('#FFFFFF'), size=12, symbol='o', pen=pg.mkPen('#FF0000', width=2))
-        self.plot.addItem(self.selected_point_marker)
-        self.point_selected.emit(self.current_track, session, ratio, lap_time)
+        for point_id, ratio, lap_time, session_type in all_points:
+            dx = ratio - mouse_point.x()
+            dy = (lap_time - mouse_point.y()) / 10  # Scale to make distance reasonable
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < min_dist and dist < threshold:
+                min_dist = dist
+                closest_point = (point_id, ratio, lap_time, session_type)
+        
+        if closest_point:
+            point_id, ratio, lap_time, session_type = closest_point
+            
+            # Check if Ctrl or Shift is pressed for multi-selection
+            modifiers = QApplication.keyboardModifiers()
+            
+            if modifiers & Qt.ControlModifier or modifiers & Qt.ShiftModifier:
+                # Toggle selection
+                if point_id in self.selected_point_ids:
+                    self.selected_point_ids.remove(point_id)
+                else:
+                    self.selected_point_ids.add(point_id)
+            else:
+                # Single click - clear other selections and select this one
+                # But only if not in selection mode
+                if not self.selection_mode:
+                    self.selected_point_ids.clear()
+                    self.selected_point_ids.add(point_id)
+            
+            self.update_selected_markers()
+            
+            # Update info text
+            minutes = int(lap_time) // 60
+            seconds = lap_time % 60
+            count = len(self.selected_point_ids)
+            parent = self.parent()
+            if count > 1 and hasattr(parent, 'info_text'):
+                parent.info_text.setText(f"{count} points selected. Right-click for delete options.")
+            elif hasattr(parent, 'info_text'):
+                parent.info_text.setText(
+                    f"Point ID: {point_id} | Session: {session_type} | "
+                    f"Ratio: {ratio:.6f} | Lap Time: {minutes}:{seconds:06.3f}"
+                )
     
     def set_formulas(self, qual_a: float, qual_b: float, race_a: float, race_b: float):
         self.qual_a = qual_a

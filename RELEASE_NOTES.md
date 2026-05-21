@@ -17,6 +17,7 @@ Previous release notes are now obsolete since this is to a great extent a new pr
 - "Downgraded" most of the visuals to avoid having a 100M program that takes forever to start.
 - Streamlined repeated libraries and cleaned up code.
 - Refactored main window into modular components: track selector and ratio panel are now separate files.
+- Addded some features to manually control everything that the program does wrong, like Track names, outlier data... :D
 - Cleaned up wine/cross-compilation to remove unused Libraries.
   - Separated files to avoid loading unnecessary libraries (e.g., PyQt5 on a program that only uses tkinter).
   - Added compression.

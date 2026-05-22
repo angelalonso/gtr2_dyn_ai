@@ -2,16 +2,19 @@
 """
 Track Names Management Tab for Setup Manager (Tkinter version)
 Allows renaming and merging track entries in the database
+Shows only database tracks (what dyn_ai and dyn_ai_visualizer actually use)
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3
+import re
 from pathlib import Path
 from typing import List, Dict, Set, Tuple, Optional
 
 from core_track_utils import normalize_track_from_path
 from core_config import get_base_path
+from core_track_scanner import scan_tracks_from_database
 
 
 class TrackManagementTab(tk.Frame):
@@ -21,7 +24,7 @@ class TrackManagementTab(tk.Frame):
         super().__init__(parent)
         self.parent = parent
         self.db_path = db_path
-        self.tracks = []
+        self.tracks = []  # List of track names from database
         self.selected_track = None
         self.gtr2_base_path = get_base_path()
         
@@ -30,36 +33,23 @@ class TrackManagementTab(tk.Frame):
         self.refresh_track_list()
     
     def setup_ui(self):
-        # Info header
-        info_frame = tk.LabelFrame(self, text="Track Name Management", 
-                                    bg='#1e1e1e', fg='#4CAF50',
-                                    font=('Arial', 11, 'bold'))
-        info_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        info_text = (
-            "This tool helps fix inconsistent track names in the database.\n\n"
-            "Track names come from AIW files like 'GAMEDATA/LOCATIONS/Estoril/3Estoril.AIW'\n"
-            "The canonical format is 'Folder/Stem' (e.g., 'Estoril/3Estoril')\n\n"
-            "You can:\n"
-            "  - Browse to any AIW file to get its canonical name\n"
-            "  - Rename individual tracks\n"
-            "  - Merge multiple tracks into one\n"
-            "  - Auto-fix common patterns"
-        )
-        info_label = tk.Label(info_frame, text=info_text, bg='#1e1e1e', fg='#888',
-                               justify=tk.LEFT, font=('Arial', 10))
-        info_label.pack(padx=15, pady=15)
-        
         # Main content - split view
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg='#1e1e1e', sashwidth=2)
         paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Left panel - track list
         left_frame = tk.Frame(paned, bg='#1e1e1e')
-        paned.add(left_frame, width=300)
+        paned.add(left_frame, width=350)
         
-        tk.Label(left_frame, text="Tracks in Database:", bg='#1e1e1e', fg='white',
-                 font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
+        title_frame = tk.Frame(left_frame, bg='#1e1e1e')
+        title_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        tk.Label(title_frame, text="Tracks in Database:", bg='#1e1e1e', fg='white',
+                 font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
+        
+        self.track_count_label = tk.Label(title_frame, text="(0 tracks)", bg='#1e1e1e', fg='#888',
+                                           font=('Arial', 9))
+        self.track_count_label.pack(side=tk.LEFT, padx=(10, 0))
         
         list_container = tk.Frame(left_frame, bg='#1e1e1e')
         list_container.pack(fill=tk.BOTH, expand=True)
@@ -68,11 +58,17 @@ class TrackManagementTab(tk.Frame):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.track_listbox = tk.Listbox(list_container, bg='#2b2b2b', fg='#4CAF50',
-                                         font=('Courier', 10), 
+                                         font=('Courier', 10), height=15,
                                          yscrollcommand=scrollbar.set)
         self.track_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.track_listbox.yview)
         self.track_listbox.bind('<<ListboxSelect>>', self.on_track_selected)
+        
+        # Refresh button below the list
+        refresh_list_btn = tk.Button(left_frame, text="Refresh List", bg='#2196F3', fg='white',
+                                      font=('Arial', 10), relief=tk.FLAT, padx=15, pady=4,
+                                      command=self.refresh_track_list)
+        refresh_list_btn.pack(pady=(10, 0))
         
         # Right panel - actions
         right_frame = tk.Frame(paned, bg='#1e1e1e')
@@ -164,41 +160,23 @@ class TrackManagementTab(tk.Frame):
                                command=self.merge_tracks)
         merge_btn.pack(pady=5)
         
-        # Auto-fix section
-        autofix_group = tk.LabelFrame(right_frame, text="Auto-Fix", 
-                                       bg='#1e1e1e', fg='#4CAF50')
-        autofix_group.pack(fill=tk.X, pady=(0, 10))
+        # Delete Track section - compact version
+        delete_group = tk.LabelFrame(right_frame, text="Delete Track", 
+                                      bg='#1e1e1e', fg='#f44336')
+        delete_group.pack(fill=tk.X, pady=(0, 10))
         
-        autofix_frame = tk.Frame(autofix_group, bg='#1e1e1e')
-        autofix_frame.pack(padx=10, pady=10, fill=tk.X)
+        delete_frame = tk.Frame(delete_group, bg='#1e1e1e')
+        delete_frame.pack(padx=10, pady=8, fill=tk.X)
         
-        self.suggested_fixes_text = tk.Text(autofix_frame, bg='#2b2b2b', fg='#4CAF50',
-                                             font=('Courier', 9), height=8, wrap=tk.WORD)
-        self.suggested_fixes_text.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        autofix_btn = tk.Button(autofix_frame, text="Find and Suggest Fixes", 
-                                 bg='#4CAF50', fg='white',
-                                 command=self.suggest_fixes)
-        autofix_btn.pack(pady=5)
-        
-        apply_all_btn = tk.Button(autofix_frame, text="Apply All Suggested Fixes", 
-                                   bg='#f44336', fg='white',
-                                   command=self.apply_all_fixes)
-        apply_all_btn.pack(pady=5)
+        delete_btn = tk.Button(delete_frame, text="Delete Selected Track", 
+                                bg='#f44336', fg='white', font=('Arial', 10, 'bold'),
+                                command=self.delete_selected_track)
+        delete_btn.pack()
         
         # Statistics
         self.stats_label = tk.Label(right_frame, text="", bg='#1e1e1e', fg='#888',
                                      font=('Arial', 9))
         self.stats_label.pack(pady=10)
-        
-        # Bottom buttons
-        bottom_frame = tk.Frame(self, bg='#1e1e1e')
-        bottom_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        refresh_btn = tk.Button(bottom_frame, text="Refresh List", 
-                                 bg='#2196F3', fg='white',
-                                 command=self.refresh_track_list)
-        refresh_btn.pack(side=tk.LEFT, padx=5)
     
     def browse_aiw_file(self):
         """Browse for an AIW file and extract its canonical name"""
@@ -237,7 +215,6 @@ class TrackManagementTab(tk.Frame):
         path_str = str(aiw_path).replace('\\', '/')
         
         # Find GameData/Locations in the path
-        import re
         match = re.search(r'(?:GameData|GAMEDATA)/(?:Locations|LOCATIONS)/([^/]+)/([^/]+)\.AIW', path_str, re.IGNORECASE)
         if match:
             folder = match.group(1)
@@ -282,41 +259,9 @@ class TrackManagementTab(tk.Frame):
         if result:
             self.rename_track()
     
-    def get_all_tracks(self) -> List[str]:
+    def get_database_tracks(self) -> List[str]:
         """Get all unique track names from database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        tracks = set()
-        
-        cursor.execute("SELECT DISTINCT track FROM data_points WHERE track IS NOT NULL")
-        for row in cursor.fetchall():
-            if row[0]:
-                tracks.add(row[0])
-        
-        try:
-            cursor.execute("SELECT DISTINCT track FROM formulas WHERE track IS NOT NULL")
-            for row in cursor.fetchall():
-                if row[0]:
-                    tracks.add(row[0])
-        except sqlite3.OperationalError:
-            pass
-        
-        cursor.execute("SELECT DISTINCT track_name FROM race_sessions WHERE track_name IS NOT NULL")
-        for row in cursor.fetchall():
-            if row[0]:
-                tracks.add(row[0])
-        
-        try:
-            cursor.execute("SELECT DISTINCT track FROM user_laptimes WHERE track IS NOT NULL")
-            for row in cursor.fetchall():
-                if row[0]:
-                    tracks.add(row[0])
-        except sqlite3.OperationalError:
-            pass
-        
-        conn.close()
-        return sorted(tracks)
+        return scan_tracks_from_database(self.db_path)
     
     def get_track_stats(self, track: str) -> Dict[str, int]:
         """Get statistics for a track"""
@@ -349,7 +294,7 @@ class TrackManagementTab(tk.Frame):
     def refresh_track_list(self):
         """Refresh the track list display"""
         self.track_listbox.delete(0, tk.END)
-        self.tracks = self.get_all_tracks()
+        self.tracks = self.get_database_tracks()
         
         self.merge_target_combo['values'] = self.tracks
         
@@ -357,17 +302,21 @@ class TrackManagementTab(tk.Frame):
         
         for i, track in enumerate(self.tracks):
             self.track_listbox.insert(tk.END, track)
-            
-            if '/' not in track:
-                self.track_listbox.itemconfig(i, fg='#FFA500')
-            elif not track.split('/')[-1] or len(track.split('/')[-1]) < 2:
-                self.track_listbox.itemconfig(i, fg='#f44336')
+            self.track_listbox.itemconfig(i, fg='#4CAF50')
         
+        self.update_merge_sources_listbox()
+        
+        # Update title with count
+        self.track_count_label.config(text=f"({len(self.tracks)} tracks)")
+        
+        self.stats_label.config(text=f"Total tracks in database: {len(self.tracks)}")
+    
+    def update_merge_sources_listbox(self):
+        """Update the merge sources listbox (exclude selected track)"""
+        self.merge_sources_listbox.delete(0, tk.END)
         for track in self.tracks:
             if track != self.selected_track:
                 self.merge_sources_listbox.insert(tk.END, track)
-        
-        self.stats_label.config(text=f"Total tracks: {len(self.tracks)}")
     
     def on_track_selected(self, event=None):
         """Handle track selection"""
@@ -378,7 +327,7 @@ class TrackManagementTab(tk.Frame):
         self.selected_track = self.tracks[selection[0]]
         stats = self.get_track_stats(self.selected_track)
         
-        info = f"Canonical ID: {self.selected_track}\n\n"
+        info = f"Track: {self.selected_track}\n\n"
         info += f"Data points: {stats['data_points']}\n"
         info += f"Race sessions: {stats['race_sessions']}\n"
         info += f"Formulas: {stats['formulas']}\n"
@@ -387,6 +336,8 @@ class TrackManagementTab(tk.Frame):
         self.track_info_label.config(text=info)
         self.rename_entry.delete(0, tk.END)
         self.rename_entry.insert(0, self.selected_track)
+        
+        self.update_merge_sources_listbox()
     
     def rename_track(self):
         """Rename the selected track"""
@@ -571,112 +522,77 @@ class TrackManagementTab(tk.Frame):
         self.refresh_track_list()
         self.merge_target_combo.set(target)
     
-    def suggest_fixes(self):
-        """Find tracks that need fixing and suggest canonical names"""
-        self.suggested_fixes_text.delete(1.0, tk.END)
-        
-        fixes = []
-        
-        for track in self.tracks:
-            if '/' in track:
-                continue
-            
-            parts = track.split('/')
-            if len(parts) == 1:
-                track_lower = track.lower()
-                
-                common_mappings = {
-                    'estoril': ('Estoril', '3Estoril'),
-                    'monza': ('Monza', 'Monza'),
-                    'spa': ('Spa', 'Spa'),
-                    'nurburgring': ('Nurburgring', 'Nurburgring'),
-                    'silverstone': ('Silverstone', 'Silverstone'),
-                    'laguna seca': ('LagunaSeca', 'LagunaSeca'),
-                    'imola': ('Imola', 'Imola'),
-                    'magny cours': ('MagnyCours', 'MagnyCours'),
-                    'barcelona': ('Barcelona', 'Barcelona'),
-                    'hungaroring': ('Hungaroring', 'Hungaroring'),
-                    'interlagos': ('Interlagos', 'Interlagos'),
-                    'melbourne': ('Melbourne', 'Melbourne'),
-                    'montreal': ('Montreal', 'Montreal'),
-                    'monaco': ('Monaco', 'Monaco'),
-                    'suzuka': ('Suzuka', 'Suzuka'),
-                    'valencia': ('Valencia', 'Valencia'),
-                    'zandvoort': ('Zandvoort', 'Zandvoort'),
-                    'donington': ('Donington', 'Donington'),
-                    'brands hatch': ('BrandsHatch', 'BrandsHatch'),
-                    'oschersleben': ('Oschersleben', 'OscherslebenA'),
-                }
-                
-                matched = False
-                for key, (folder, stem) in common_mappings.items():
-                    if key in track_lower:
-                        canonical = f"{folder}/{stem}"
-                        fixes.append((track, canonical))
-                        matched = True
-                        break
-                
-                if not matched:
-                    folder = track.replace(' ', '')
-                    canonical = f"{folder}/{track}"
-                    fixes.append((track, canonical))
-        
-        if fixes:
-            self.suggested_fixes_text.insert(tk.END, "Suggested fixes:\n\n")
-            for old, new in fixes:
-                self.suggested_fixes_text.insert(tk.END, f"  {old}  ->  {new}\n")
-            return fixes
-        else:
-            self.suggested_fixes_text.insert(tk.END, "All tracks appear to be in canonical format.\n\nNo fixes suggested.")
-            return []
-    
-    def apply_all_fixes(self):
-        """Apply all suggested fixes"""
-        fixes = self.suggest_fixes()
-        
-        if not fixes:
-            messagebox.showinfo("No Fixes", "No fixes to apply.")
+    def delete_selected_track(self):
+        """Completely delete the selected track and all its associated data from the database"""
+        if not self.selected_track:
+            messagebox.showwarning("No Selection", "Please select a track to delete.")
             return
         
+        stats = self.get_track_stats(self.selected_track)
+        
+        warning_text = f"Delete track '{self.selected_track}'?\n\n"
+        
+        if stats['data_points'] > 0:
+            warning_text += f"Data points: {stats['data_points']}\n"
+        if stats['race_sessions'] > 0:
+            warning_text += f"Race sessions: {stats['race_sessions']}\n"
+        if stats['formulas'] > 0:
+            warning_text += f"Formulas: {stats['formulas']}\n"
+        if stats['user_laptimes'] > 0:
+            warning_text += f"User laptimes: {stats['user_laptimes']}\n"
+        
+        if stats['data_points'] == 0 and stats['race_sessions'] == 0 and stats['formulas'] == 0 and stats['user_laptimes'] == 0:
+            warning_text += "\nThis track has no associated data.\n\n"
+        
+        warning_text += "\nTHIS ACTION CANNOT BE UNDONE!\n\nContinue?"
+        
         result = messagebox.askyesno(
-            "Apply All Fixes",
-            f"Apply {len(fixes)} suggested fixes?\n\n"
-            "This will rename multiple tracks. You can review each change.\n\n"
-            "Continue?"
+            "Confirm Delete - WARNING",
+            warning_text,
+            icon='warning'
         )
         
         if not result:
             return
         
-        applied = 0
-        skipped = 0
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        for old_name, new_name in fixes:
-            if new_name in self.tracks:
-                result = messagebox.askyesno(
-                    "Track Exists",
-                    f"'{new_name}' already exists.\n\n"
-                    f"Do you want to MERGE '{old_name}' into '{new_name}'?"
-                )
-                if result:
-                    if self.merge_tracks_impl(old_name, new_name):
-                        applied += 1
-                    else:
-                        skipped += 1
-            else:
-                result = messagebox.askyesno(
-                    "Rename Track",
-                    f"Rename '{old_name}' to '{new_name}'?"
-                )
-                if result:
-                    self.do_rename(old_name, new_name)
-                    applied += 1
-                else:
-                    skipped += 1
-        
-        messagebox.showinfo("Auto-Fix Complete", 
-            f"Applied {applied} fixes.\n"
-            f"Skipped {skipped} fixes.\n\n"
-            f"Click Refresh List to see changes.")
-        
-        self.refresh_track_list()
+        try:
+            cursor.execute("DELETE FROM data_points WHERE track = ?", (self.selected_track,))
+            data_deleted = cursor.rowcount
+            
+            cursor.execute("DELETE FROM race_sessions WHERE track_name = ?", (self.selected_track,))
+            sessions_deleted = cursor.rowcount
+            
+            try:
+                cursor.execute("DELETE FROM formulas WHERE track = ?", (self.selected_track,))
+                formulas_deleted = cursor.rowcount
+            except sqlite3.OperationalError:
+                formulas_deleted = 0
+            
+            try:
+                cursor.execute("DELETE FROM user_laptimes WHERE track = ?", (self.selected_track,))
+                laptimes_deleted = cursor.rowcount
+            except sqlite3.OperationalError:
+                laptimes_deleted = 0
+            
+            conn.commit()
+            
+            messagebox.showinfo("Delete Complete", 
+                f"Track '{self.selected_track}' has been deleted.\n\n"
+                f"Deleted:\n"
+                f"  - {data_deleted} data points\n"
+                f"  - {sessions_deleted} race sessions\n"
+                f"  - {formulas_deleted} formulas\n"
+                f"  - {laptimes_deleted} user laptimes\n\n"
+                f"The track will no longer appear in dyn_ai and dyn_ai_visualizer.")
+            
+            self.selected_track = None
+            self.refresh_track_list()
+            
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("Delete Failed", f"Error: {str(e)}")
+        finally:
+            conn.close()

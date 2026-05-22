@@ -54,7 +54,6 @@ class TrackClassSelector(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(15)
         
-        # Track selection group
         track_group = QFrame()
         track_group.setStyleSheet("background-color: #2b2b2b; border-radius: 5px; padding: 8px;")
         track_layout = QHBoxLayout(track_group)
@@ -73,7 +72,6 @@ class TrackClassSelector(QWidget):
         
         layout.addWidget(track_group)
         
-        # Class selection group
         class_group = QFrame()
         class_group.setStyleSheet("background-color: #2b2b2b; border-radius: 5px; padding: 8px;")
         class_layout = QHBoxLayout(class_group)
@@ -93,7 +91,6 @@ class TrackClassSelector(QWidget):
         layout.addWidget(class_group)
         layout.addStretch()
         
-        # Refresh button
         self.refresh_btn = QPushButton("Refresh Data")
         self.refresh_btn.setStyleSheet("background-color: #4CAF50;")
         self.refresh_btn.clicked.connect(self.refresh_data)
@@ -108,7 +105,6 @@ class TrackClassSelector(QWidget):
         else:
             self.all_tracks = get_available_tracks(self.base_path, self.db.db_path)
         
-        # Build class mapping for each track
         class_mapping = load_vehicle_classes()
         
         if self.db.database_exists():
@@ -140,7 +136,6 @@ class TrackClassSelector(QWidget):
             
             conn.close()
         
-        # Set defaults if available
         if self.all_tracks and not self.current_track:
             self.current_track = self.all_tracks[0]
             self.track_label.setText(self.current_track)
@@ -283,25 +278,20 @@ class FormulaVisualizer(QMainWindow):
         self.base_path = get_base_path(config_file)
         self.min_ratio, self.max_ratio = get_ratio_limits(config_file)
         
-        # Load vehicle classes
         vehicle_classes_path = get_data_file_path("vehicle_classes.json")
         self.class_mapping = load_vehicle_classes(vehicle_classes_path)
         
-        # Initialize autopilot manager
         self.autopilot_manager = AutopilotManager(self.db)
         self.autopilot_manager.set_ratio_limits(self.min_ratio, self.max_ratio)
         
-        # Initialize user laptimes manager
         from core_config import get_nr_last_user_laptimes
         max_laptimes = get_nr_last_user_laptimes(config_file)
         self.user_laptimes_manager = UserLapTimesManager(self.db_path, max_laptimes)
         self.autopilot_manager.set_user_laptimes_manager(self.user_laptimes_manager)
         
-        # Current state - these will be set by the selector
         self.current_track = ""
         self.current_vehicle_class = ""
         
-        # Formula values with default flags
         self.qual_a = DEFAULT_A_VALUE
         self.qual_b = 70.0
         self.race_a = DEFAULT_A_VALUE
@@ -309,7 +299,6 @@ class FormulaVisualizer(QMainWindow):
         self.qual_is_default = True
         self.race_is_default = True
         
-        # User times
         self.user_qual_time = None
         self.user_race_time = None
         self.median_qual_time = None
@@ -317,17 +306,18 @@ class FormulaVisualizer(QMainWindow):
         self.last_qual_ratio = None
         self.last_race_ratio = None
         
-        # AI times
         self.qual_best_ai = None
         self.qual_worst_ai = None
         self.race_best_ai = None
         self.race_worst_ai = None
         
-        # User history
         self.user_qual_history = []
         self.user_race_history = []
+        
+        # Flag to prevent recursive reloads
+        self._is_loading = False
+        self._pending_refresh = False
 
-        # Get screen size and set appropriate window size
         screen = QApplication.primaryScreen()
         if screen:
             screen_geometry = screen.availableGeometry()
@@ -357,22 +347,16 @@ class FormulaVisualizer(QMainWindow):
 
         self.setup_ui()
         self.setup_db_watcher()
-        self.setup_refresh_timer()
         
-        # Connect lock signals
         self.qual_panel.lock_toggled.connect(self.on_lock_toggled)
         self.race_panel.lock_toggled.connect(self.on_lock_toggled)
         
-        # Connect points_deleted signal
         self.curve_graph.points_deleted.connect(self.on_points_deleted)
         
-        # Load initial data after UI is ready
         self.selector.load_data()
-        # Trigger initial selection after a short delay to ensure UI is fully initialized
         QTimer.singleShot(100, self._emit_initial_selection)
 
     def _emit_initial_selection(self):
-        """Emit the initial selection after UI is ready"""
         if self.current_track and self.current_vehicle_class:
             self.on_selection_changed(self.current_track, self.current_vehicle_class)
 
@@ -383,51 +367,51 @@ class FormulaVisualizer(QMainWindow):
     def setup_db_watcher(self):
         """Watch the SQLite database file for changes made by other processes."""
         self._watcher = QFileSystemWatcher(self)
-        self._watcher.addPath(self.db_path)
+        if Path(self.db_path).exists():
+            self._watcher.addPath(self.db_path)
+            logger.debug(f"Watching database: {self.db_path}")
         
-        wal_path = self.db_path + "-wal"
-        if Path(wal_path).exists():
-            self._watcher.addPath(wal_path)
-            
         self._watcher.fileChanged.connect(self._on_db_file_changed)
-
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.setInterval(300)
+        self._refresh_timer.setInterval(500)
         self._refresh_timer.timeout.connect(self._do_full_refresh)
 
     def _on_db_file_changed(self, path: str):
-        if path not in self._watcher.files():
+        """Handle database file change - only reload if not in the middle of our own update"""
+        if self._is_loading:
+            # We're in the middle of our own update, ignore this signal
+            logger.debug("Ignoring db change during our own update")
+            return
+        
+        # Re-add the path if it was removed
+        if path not in self._watcher.files() and Path(path).exists():
             self._watcher.addPath(path)
         
-        wal_path = self.db_path + "-wal"
-        if Path(wal_path).exists() and wal_path not in self._watcher.files():
-            self._watcher.addPath(wal_path)
-            
+        # Schedule a refresh
         self._refresh_timer.start()
 
-    def setup_refresh_timer(self):
-        """Periodic refresh as fallback (every 2 seconds)"""
-        self._periodic_timer = QTimer(self)
-        self._periodic_timer.setInterval(2000)
-        self._periodic_timer.timeout.connect(self._check_and_update)
-        self._periodic_timer.start()
-
     def _do_full_refresh(self):
-        """Full refresh from database"""
-        logger.debug("Database change detected - refreshing visualizer")
+        """Full refresh from database - only if not in loading state"""
+        if self._is_loading:
+            self._pending_refresh = True
+            return
+        
         if self.current_track and self.current_vehicle_class:
-            self.load_current_data()
-            self.update_all_display()
-            if self.curve_graph:
-                self.curve_graph.load_data()
-                self.curve_graph.full_refresh()
-
-    def _check_and_update(self):
-        """Check for changes and update if needed"""
-        if self.current_track and self.current_vehicle_class:
-            self.load_current_data()
-            self.update_all_display()
+            logger.debug("Database change detected - refreshing visualizer")
+            self._is_loading = True
+            try:
+                self.load_current_data()
+                self.update_all_display()
+                if self.curve_graph:
+                    self.curve_graph.load_data()
+                    self.curve_graph.full_refresh()
+            finally:
+                self._is_loading = False
+                
+                if self._pending_refresh:
+                    self._pending_refresh = False
+                    QTimer.singleShot(100, self._do_full_refresh)
 
     # ------------------------------------------------------------------
     # Data loading
@@ -435,113 +419,111 @@ class FormulaVisualizer(QMainWindow):
 
     def load_current_data(self):
         """Load the current data from the database based on selected track/class"""
+        if self._is_loading:
+            return
+        
         if not self.current_track or not self.current_vehicle_class:
             return
         
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        self._is_loading = True
         
-        # Check what columns exist in formulas table
         try:
-            cursor.execute("PRAGMA table_info(formulas)")
-            formula_columns = [col[1] for col in cursor.fetchall()]
-            logger.debug(f"Formulas table columns: {formula_columns}")
-        except sqlite3.OperationalError:
-            formula_columns = []
-            logger.debug("Formulas table does not exist yet")
-        
-        # Load formulas for current track/class
-        qual_formula = self._get_formula_direct(cursor, self.current_track, self.current_vehicle_class, "qual", formula_columns)
-        if qual_formula:
-            self.qual_a = qual_formula[0]
-            self.qual_b = qual_formula[1]
-            self.qual_is_default = False
-            logger.info(f"Loaded qual formula: {get_formula_string(self.qual_a, self.qual_b)}")
-        else:
-            self.qual_a = DEFAULT_A_VALUE
-            self.qual_b = 70.0
-            self.qual_is_default = True
-            logger.info(f"No qual formula found, using default: {get_formula_string(self.qual_a, self.qual_b)}")
-        
-        race_formula = self._get_formula_direct(cursor, self.current_track, self.current_vehicle_class, "race", formula_columns)
-        if race_formula:
-            self.race_a = race_formula[0]
-            self.race_b = race_formula[1]
-            self.race_is_default = False
-            logger.info(f"Loaded race formula: {get_formula_string(self.race_a, self.race_b)}")
-        else:
-            self.race_a = DEFAULT_A_VALUE
-            self.race_b = 70.0
-            self.race_is_default = True
-            logger.info(f"No race formula found, using default: {get_formula_string(self.race_a, self.race_b)}")
-        
-        # Load user laptimes
-        cursor.execute("""
-            SELECT lap_time, ratio FROM user_laptimes 
-            WHERE track = ? AND vehicle_class = ? AND session_type = 'qual'
-            ORDER BY timestamp DESC LIMIT 1
-        """, (self.current_track, self.current_vehicle_class))
-        qual_row = cursor.fetchone()
-        if qual_row:
-            self.user_qual_time = qual_row[0]
-            self.last_qual_ratio = qual_row[1]
-        else:
-            self.user_qual_time = None
-            self.last_qual_ratio = None
-        
-        cursor.execute("""
-            SELECT lap_time, ratio FROM user_laptimes 
-            WHERE track = ? AND vehicle_class = ? AND session_type = 'race'
-            ORDER BY timestamp DESC LIMIT 1
-        """, (self.current_track, self.current_vehicle_class))
-        race_row = cursor.fetchone()
-        if race_row:
-            self.user_race_time = race_row[0]
-            self.last_race_ratio = race_row[1]
-        else:
-            self.user_race_time = None
-            self.last_race_ratio = None
-        
-        # History for graph
-        cursor.execute("""
-            SELECT lap_time, ratio FROM user_laptimes 
-            WHERE track = ? AND vehicle_class = ? AND session_type = 'qual'
-            ORDER BY timestamp ASC
-        """, (self.current_track, self.current_vehicle_class))
-        self.user_qual_history = cursor.fetchall()
-        
-        cursor.execute("""
-            SELECT lap_time, ratio FROM user_laptimes 
-            WHERE track = ? AND vehicle_class = ? AND session_type = 'race'
-            ORDER BY timestamp ASC
-        """, (self.current_track, self.current_vehicle_class))
-        self.user_race_history = cursor.fetchall()
-        
-        # Median times
-        cursor.execute("""
-            SELECT lap_time FROM user_laptimes 
-            WHERE track = ? AND vehicle_class = ? AND session_type = 'qual'
-        """, (self.current_track, self.current_vehicle_class))
-        qual_times = [row[0] for row in cursor.fetchall()]
-        self.median_qual_time = self._calculate_median(qual_times) if qual_times else None
-        
-        cursor.execute("""
-            SELECT lap_time FROM user_laptimes 
-            WHERE track = ? AND vehicle_class = ? AND session_type = 'race'
-        """, (self.current_track, self.current_vehicle_class))
-        race_times = [row[0] for row in cursor.fetchall()]
-        self.median_race_time = self._calculate_median(race_times) if race_times else None
-        
-        # AI times for range
-        self.qual_best_ai, self.qual_worst_ai = self._get_ai_times_for_track(self.current_track, "qual", self.current_vehicle_class)
-        self.race_best_ai, self.race_worst_ai = self._get_ai_times_for_track(self.current_track, "race", self.current_vehicle_class)
-        
-        conn.close()
-        
-        logger.debug(f"Loaded data for track={self.current_track}, class={self.current_vehicle_class}")
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute("PRAGMA table_info(formulas)")
+                formula_columns = [col[1] for col in cursor.fetchall()]
+            except sqlite3.OperationalError:
+                formula_columns = []
+            
+            qual_formula = self._get_formula_direct(cursor, self.current_track, self.current_vehicle_class, "qual", formula_columns)
+            if qual_formula:
+                # Only update if the formula hasn't been manually modified
+                if not self.qual_panel.formula_modified:
+                    self.qual_a = qual_formula[0]
+                    self.qual_b = qual_formula[1]
+                    self.qual_is_default = False
+            else:
+                if not self.qual_panel.formula_modified:
+                    self.qual_a = DEFAULT_A_VALUE
+                    self.qual_b = 70.0
+                    self.qual_is_default = True
+            
+            race_formula = self._get_formula_direct(cursor, self.current_track, self.current_vehicle_class, "race", formula_columns)
+            if race_formula:
+                if not self.race_panel.formula_modified:
+                    self.race_a = race_formula[0]
+                    self.race_b = race_formula[1]
+                    self.race_is_default = False
+            else:
+                if not self.race_panel.formula_modified:
+                    self.race_a = DEFAULT_A_VALUE
+                    self.race_b = 70.0
+                    self.race_is_default = True
+            
+            cursor.execute("""
+                SELECT lap_time, ratio FROM user_laptimes 
+                WHERE track = ? AND vehicle_class = ? AND session_type = 'qual'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (self.current_track, self.current_vehicle_class))
+            qual_row = cursor.fetchone()
+            if qual_row:
+                self.user_qual_time = qual_row[0]
+                self.last_qual_ratio = qual_row[1]
+            else:
+                self.user_qual_time = None
+                self.last_qual_ratio = None
+            
+            cursor.execute("""
+                SELECT lap_time, ratio FROM user_laptimes 
+                WHERE track = ? AND vehicle_class = ? AND session_type = 'race'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (self.current_track, self.current_vehicle_class))
+            race_row = cursor.fetchone()
+            if race_row:
+                self.user_race_time = race_row[0]
+                self.last_race_ratio = race_row[1]
+            else:
+                self.user_race_time = None
+                self.last_race_ratio = None
+            
+            cursor.execute("""
+                SELECT lap_time, ratio FROM user_laptimes 
+                WHERE track = ? AND vehicle_class = ? AND session_type = 'qual'
+                ORDER BY timestamp ASC
+            """, (self.current_track, self.current_vehicle_class))
+            self.user_qual_history = cursor.fetchall()
+            
+            cursor.execute("""
+                SELECT lap_time, ratio FROM user_laptimes 
+                WHERE track = ? AND vehicle_class = ? AND session_type = 'race'
+                ORDER BY timestamp ASC
+            """, (self.current_track, self.current_vehicle_class))
+            self.user_race_history = cursor.fetchall()
+            
+            cursor.execute("""
+                SELECT lap_time FROM user_laptimes 
+                WHERE track = ? AND vehicle_class = ? AND session_type = 'qual'
+            """, (self.current_track, self.current_vehicle_class))
+            qual_times = [row[0] for row in cursor.fetchall()]
+            self.median_qual_time = self._calculate_median(qual_times) if qual_times else None
+            
+            cursor.execute("""
+                SELECT lap_time FROM user_laptimes 
+                WHERE track = ? AND vehicle_class = ? AND session_type = 'race'
+            """, (self.current_track, self.current_vehicle_class))
+            race_times = [row[0] for row in cursor.fetchall()]
+            self.median_race_time = self._calculate_median(race_times) if race_times else None
+            
+            self.qual_best_ai, self.qual_worst_ai = self._get_ai_times_for_track(self.current_track, "qual", self.current_vehicle_class)
+            self.race_best_ai, self.race_worst_ai = self._get_ai_times_for_track(self.current_track, "race", self.current_vehicle_class)
+            
+            conn.close()
+        finally:
+            self._is_loading = False
 
     def _get_formula_direct(self, cursor, track: str, vehicle_class: str, session_type: str, formula_columns: list):
-        """Get formula directly from database"""
         if 'updated_at' in formula_columns:
             order_by = "ORDER BY updated_at DESC"
         else:
@@ -558,15 +540,13 @@ class FormulaVisualizer(QMainWindow):
             cursor.execute(query, (track, vehicle_class, session_type))
             row = cursor.fetchone()
             if row:
-                logger.info(f"Found formula for {track}/{vehicle_class}/{session_type}: a={row[0]:.4f}, b={row[1]:.4f}")
                 return row
-        except sqlite3.OperationalError as e:
-            logger.debug(f"Error querying formulas: {e}")
+        except sqlite3.OperationalError:
+            pass
         
         return None
 
     def _get_ai_times_for_track(self, track: str, session_type: str, vehicle_class: str):
-        """Get best and worst AI times for a track and vehicle class"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -605,7 +585,6 @@ class FormulaVisualizer(QMainWindow):
         return (row[0], row[1]) if row[0] is not None else (None, None)
 
     def _calculate_median(self, values):
-        """Calculate median of a list"""
         if not values:
             return None
         values.sort()
@@ -616,10 +595,12 @@ class FormulaVisualizer(QMainWindow):
 
     def update_all_display(self):
         """Update all display elements with current data"""
+        if self._is_loading:
+            return
+        
         if not self.current_track or not self.current_vehicle_class:
             return
         
-        # Ensure panels have the current track and class
         if hasattr(self, 'qual_panel'):
             self.qual_panel.set_current_track_class(self.current_track, self.current_vehicle_class)
             self.race_panel.set_current_track_class(self.current_track, self.current_vehicle_class)
@@ -678,17 +659,10 @@ class FormulaVisualizer(QMainWindow):
         self.setWindowTitle(title)
 
     def on_points_deleted(self, deleted_points):
-        """Handle points_deleted signal from the graph"""
         logger.info(f"Points deleted: {len(deleted_points)} point(s)")
-        
-        # Refresh formulas after points are deleted
         self.autopilot_manager.reload_formulas()
-        
-        # Reload current data and update display
         self.load_current_data()
         self.update_all_display()
-        
-        # Force graph to refresh
         if self.curve_graph:
             self.curve_graph.load_data()
             self.curve_graph.full_refresh()
@@ -698,9 +672,7 @@ class FormulaVisualizer(QMainWindow):
     # ------------------------------------------------------------------
 
     def on_lock_toggled(self, session_type: str, is_locked: bool):
-        """Handle lock toggle from session panel"""
         if not self.current_track or not self.current_vehicle_class:
-            # Revert the toggle if no selection
             if session_type == "qual":
                 self.qual_panel.set_locked_status(False)
             else:
@@ -716,8 +688,6 @@ class FormulaVisualizer(QMainWindow):
                 else:
                     self.race_panel.set_locked_status(False)
                 QMessageBox.warning(self, "Lock Failed", "Could not lock formula. It may not exist yet.")
-            else:
-                logger.info(f"Locked {session_type} formula for {self.current_track}/{self.current_vehicle_class}")
         else:
             success = self.autopilot_manager.unlock_formula(self.current_track, self.current_vehicle_class, session_type)
             if not success:
@@ -726,11 +696,8 @@ class FormulaVisualizer(QMainWindow):
                 else:
                     self.race_panel.set_locked_status(True)
                 QMessageBox.warning(self, "Unlock Failed", "Could not unlock formula.")
-            else:
-                logger.info(f"Unlocked {session_type} formula for {self.current_track}/{self.current_vehicle_class}")
     
     def update_formula_lock_status(self):
-        """Update the lock status display in panels"""
         if not self.current_track or not self.current_vehicle_class:
             return
         
@@ -767,6 +734,7 @@ class FormulaVisualizer(QMainWindow):
         qual_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
         
         self.qual_panel = SessionPanel("qual", "Qualifying Session", self.db, self)
+        self.qual_panel.formula_preview.connect(self.on_qual_formula_preview)
         self.qual_panel.formula_changed.connect(self.on_qual_formula_changed)
         self.qual_panel.show_data_toggled.connect(self.on_show_data_toggled)
         self.qual_panel.calculate_ratio.connect(self.on_calculate_ratio)
@@ -780,6 +748,7 @@ class FormulaVisualizer(QMainWindow):
         race_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
         
         self.race_panel = SessionPanel("race", "Race Session", self.db, self)
+        self.race_panel.formula_preview.connect(self.on_race_formula_preview)
         self.race_panel.formula_changed.connect(self.on_race_formula_changed)
         self.race_panel.show_data_toggled.connect(self.on_show_data_toggled)
         self.race_panel.calculate_ratio.connect(self.on_calculate_ratio)
@@ -824,9 +793,10 @@ class FormulaVisualizer(QMainWindow):
         self.current_track = track
         self.current_vehicle_class = vehicle_class
         
-        # Update session panels with current track and class
         self.qual_panel.set_current_track_class(track, vehicle_class)
         self.race_panel.set_current_track_class(track, vehicle_class)
+        self.qual_panel.formula_modified = False
+        self.race_panel.formula_modified = False
         
         if self.curve_graph:
             self.curve_graph.current_track = track
@@ -839,7 +809,30 @@ class FormulaVisualizer(QMainWindow):
             self.curve_graph.load_data()
             self.curve_graph.full_refresh()
 
+    def on_qual_formula_preview(self, session_type: str, a: float, b: float):
+        """Live preview of formula changes - updates graph only, no save"""
+        self.qual_a = a
+        self.qual_b = b
+        self.qual_is_default = False
+        if self.curve_graph:
+            self.curve_graph.set_formula_is_default("qual", False)
+            self.curve_graph.qual_a = a
+            self.curve_graph.qual_b = b
+            self.curve_graph.update_graph()
+
+    def on_race_formula_preview(self, session_type: str, a: float, b: float):
+        """Live preview of formula changes - updates graph only, no save"""
+        self.race_a = a
+        self.race_b = b
+        self.race_is_default = False
+        if self.curve_graph:
+            self.curve_graph.set_formula_is_default("race", False)
+            self.curve_graph.race_a = a
+            self.curve_graph.race_b = b
+            self.curve_graph.update_graph()
+
     def on_qual_formula_changed(self, session_type: str, a: float, b: float):
+        """Save formula to database when explicitly accepted"""
         self.qual_a = a
         self.qual_b = b
         self.qual_is_default = False
@@ -860,7 +853,6 @@ class FormulaVisualizer(QMainWindow):
                 confidence=0.7
             )
             if formula.is_valid():
-                # Check if formula is locked - preserve lock status
                 existing = self.autopilot_manager.formula_manager.get_formula_by_class(
                     self.current_track, self.current_vehicle_class, "qual"
                 )
@@ -870,10 +862,9 @@ class FormulaVisualizer(QMainWindow):
                     formula.lock_reason = existing.lock_reason
                 self.autopilot_manager.formula_manager.save_formula(formula)
                 logger.info(f"Saved qual formula for {self.current_track}/{self.current_vehicle_class}: {get_formula_string(a, b)}")
-                QTimer.singleShot(100, lambda: self.load_current_data())
-                QTimer.singleShot(150, lambda: self.update_all_display())
 
     def on_race_formula_changed(self, session_type: str, a: float, b: float):
+        """Save formula to database when explicitly accepted"""
         self.race_a = a
         self.race_b = b
         self.race_is_default = False
@@ -894,7 +885,6 @@ class FormulaVisualizer(QMainWindow):
                 confidence=0.7
             )
             if formula.is_valid():
-                # Check if formula is locked - preserve lock status
                 existing = self.autopilot_manager.formula_manager.get_formula_by_class(
                     self.current_track, self.current_vehicle_class, "race"
                 )
@@ -904,8 +894,6 @@ class FormulaVisualizer(QMainWindow):
                     formula.lock_reason = existing.lock_reason
                 self.autopilot_manager.formula_manager.save_formula(formula)
                 logger.info(f"Saved race formula for {self.current_track}/{self.current_vehicle_class}: {get_formula_string(a, b)}")
-                QTimer.singleShot(100, lambda: self.load_current_data())
-                QTimer.singleShot(150, lambda: self.update_all_display())
 
     def on_show_data_toggled(self, session_type: str, show: bool):
         if self.curve_graph:
@@ -1001,7 +989,6 @@ class FormulaVisualizer(QMainWindow):
                 "No track or vehicle class selected. Please select a track and class first.")
             return
         
-        # Check if formula is locked
         is_locked = self.autopilot_manager.is_formula_locked(self.current_track, self.current_vehicle_class, session_type)
         if is_locked:
             QMessageBox.warning(self, "Formula Locked", 
@@ -1035,7 +1022,6 @@ class FormulaVisualizer(QMainWindow):
         from core_config import get_outlier_settings
         outlier_config = get_outlier_settings(self.config_file)
         
-        # Determine if we should optimize A
         optimize_a = len(rows) <= 3
         
         a, b, stats = fit_hyperbolic(
@@ -1049,7 +1035,6 @@ class FormulaVisualizer(QMainWindow):
         )
         
         if a is not None and b is not None:
-            # Preserve lock status if formula exists
             existing = self.autopilot_manager.formula_manager.get_formula_by_class(
                 self.current_track, self.current_vehicle_class, session_filter
             )

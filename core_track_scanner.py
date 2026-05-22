@@ -97,28 +97,21 @@ def scan_tracks_from_database(db_path: str) -> List[str]:
 
 def get_available_tracks(base_path: Path, db_path: str = None) -> List[str]:
     """
-    Get all available tracks by merging filesystem and database results.
-    Prefers filesystem tracks (actual installed tracks) but includes database tracks.
+    Get available tracks from the database only.
+    Filesystem tracks are NOT included unless they have data in the database.
     
     Args:
-        base_path: GTR2 installation path
-        db_path: Optional path to database for additional tracks
+        base_path: GTR2 installation path (unused, kept for compatibility)
+        db_path: Path to database for tracks
     
     Returns:
-        Sorted list of unique track names
+        Sorted list of unique track names from database
     """
-    if not base_path:
+    if not db_path:
         return []
     
-    fs_tracks = scan_tracks_from_filesystem(base_path)
-    
-    all_tracks = set(fs_tracks)
-    
-    if db_path:
-        db_tracks = scan_tracks_from_database(db_path)
-        all_tracks.update(db_tracks)
-    
-    return sorted(all_tracks)
+    db_tracks = scan_tracks_from_database(db_path)
+    return sorted(db_tracks)
 
 
 def find_aiw_file_for_track(track_name: str, base_path: Path) -> Optional[Path]:

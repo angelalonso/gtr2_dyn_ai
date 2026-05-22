@@ -6,24 +6,135 @@ Provides the qualifying and race session control panels
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QGroupBox, QCheckBox, QDoubleSpinBox, QMessageBox
+    QGroupBox, QCheckBox, QDoubleSpinBox, QMessageBox, QDialog,
+    QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from core_config import get_ratio_limits
-from core_math import DEFAULT_A_VALUE, ratio_from_time, clamp_ratio, get_formula_string
+from core_config import get_ratio_limits, get_outlier_settings
+from core_math import (
+    DEFAULT_A_VALUE, time_from_ratio, ratio_from_time, clamp_ratio, 
+    get_formula_string, fit_hyperbolic
+)
 from gui_common_dialogs import ManualLapTimeDialog
+
+
+class AutoFitResultDialog(QDialog):
+    """Dialog showing Auto-Fit results and asking for acceptance"""
+    
+    def __init__(self, parent, session_type: str, old_a: float, old_b: float, 
+                 new_a: float, new_b: float, stats, points_count: int, outliers_removed: int):
+        super().__init__(parent)
+        self.session_type = session_type
+        self.old_a = old_a
+        self.old_b = old_b
+        self.new_a = new_a
+        self.new_b = new_b
+        self.stats = stats
+        self.points_count = points_count
+        self.outliers_removed = outliers_removed
+        self.accepted_formula = False
+        
+        self.setWindowTitle(f"Auto-Fit Results - {session_type.upper()}")
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(400)
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        info_label = QLabel(f"Auto-Fit completed for {self.session_type.upper()} session")
+        info_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #FFA500;")
+        layout.addWidget(info_label)
+        
+        layout.addSpacing(10)
+        
+        formula_group = QGroupBox("Formula Comparison")
+        formula_layout = QVBoxLayout(formula_group)
+        
+        old_formula = QLabel(f"Old formula: {get_formula_string(self.old_a, self.old_b)}")
+        old_formula.setStyleSheet("color: #888; font-family: monospace;")
+        formula_layout.addWidget(old_formula)
+        
+        new_formula = QLabel(f"New formula: {get_formula_string(self.new_a, self.new_b)}")
+        new_formula.setStyleSheet("color: #4CAF50; font-family: monospace; font-weight: bold;")
+        formula_layout.addWidget(new_formula)
+        
+        layout.addWidget(formula_group)
+        
+        stats_group = QGroupBox("Fit Statistics")
+        stats_layout = QVBoxLayout(stats_group)
+        
+        points_used = self.points_count - self.outliers_removed
+        stats_layout.addWidget(QLabel(f"Data points used: {points_used} (out of {self.points_count})"))
+        
+        if self.outliers_removed > 0:
+            outlier_label = QLabel(f"Outliers removed: {self.outliers_removed}")
+            outlier_label.setStyleSheet("color: #FFA500;")
+            stats_layout.addWidget(outlier_label)
+        
+        stats_layout.addWidget(QLabel(f"Average error: {self.stats.avg_error:.3f} seconds"))
+        stats_layout.addWidget(QLabel(f"Maximum error: {self.stats.max_error:.3f} seconds"))
+        
+        if self.stats.avg_error < 0.5:
+            quality = "Excellent"
+            color = "#4CAF50"
+        elif self.stats.avg_error < 1.0:
+            quality = "Good"
+            color = "#8BC34A"
+        elif self.stats.avg_error < 1.5:
+            quality = "Fair"
+            color = "#FFC107"
+        elif self.stats.avg_error < 2.5:
+            quality = "Poor"
+            color = "#FF9800"
+        else:
+            quality = "Very Poor"
+            color = "#f44336"
+        
+        quality_label = QLabel(f"Fit quality: {quality}")
+        quality_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        stats_layout.addWidget(quality_label)
+        
+        layout.addWidget(stats_group)
+        
+        if self.outliers_removed > 0:
+            warning_label = QLabel(
+                f"Warning: {self.outliers_removed} outlier(s) were detected and excluded from the fit.\n"
+                f"You may want to review these points in the graph."
+            )
+            warning_label.setStyleSheet("color: #FFA500;")
+            warning_label.setWordWrap(True)
+            layout.addWidget(warning_label)
+        
+        layout.addSpacing(10)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.Ok).setText("Apply Formula")
+        button_box.button(QDialogButtonBox.Cancel).setText("Keep Old Formula")
+        layout.addWidget(button_box)
+    
+    def accept(self):
+        self.accepted_formula = True
+        super().accept()
+    
+    def reject(self):
+        self.accepted_formula = False
+        super().reject()
 
 
 class SessionPanel(QWidget):
     """Panel for a single session (Qualifying or Race) with controls"""
     
-    formula_changed = pyqtSignal(str, float, float)
+    formula_changed = pyqtSignal(str, float, float)  # Emitted when formula should be saved
+    formula_preview = pyqtSignal(str, float, float)  # Emitted for live preview (no save)
     show_data_toggled = pyqtSignal(str, bool)
     calculate_ratio = pyqtSignal(str, float)
     auto_fit_requested = pyqtSignal(str)
     lap_time_edited = pyqtSignal(str, float)
-    lock_toggled = pyqtSignal(str, bool)  # session_type, is_locked
+    lock_toggled = pyqtSignal(str, bool)
     
     def __init__(self, session_type: str, title: str, db, parent=None):
         super().__init__(parent)
@@ -40,15 +151,14 @@ class SessionPanel(QWidget):
         self.calc_button_modified = False
         self.formula_is_default = True
         self.formula_is_locked = False
+        self.formula_modified = False
         
-        # Store current track and class - will be updated from main window
         self.current_track = ""
         self.current_vehicle_class = ""
         
         self.setup_ui()
     
     def set_current_track_class(self, track: str, vehicle_class: str):
-        """Set the current track and vehicle class from the main window"""
         self.current_track = track
         self.current_vehicle_class = vehicle_class
         
@@ -142,7 +252,7 @@ class SessionPanel(QWidget):
         self.a_spin.setDecimals(3)
         self.a_spin.setValue(self.a)
         self.a_spin.setFixedWidth(70)
-        self.a_spin.valueChanged.connect(self.on_param_changed)
+        self.a_spin.valueChanged.connect(self.on_a_changed)
         row2.addWidget(self.a_spin)
 
         row2.addWidget(QLabel("b:"))
@@ -151,7 +261,7 @@ class SessionPanel(QWidget):
         self.b_spin.setDecimals(3)
         self.b_spin.setValue(self.b)
         self.b_spin.setFixedWidth(70)
-        self.b_spin.valueChanged.connect(self.on_param_changed)
+        self.b_spin.valueChanged.connect(self.on_b_changed)
         row2.addWidget(self.b_spin)
         row2.addStretch()
         group_layout.addLayout(row2)
@@ -185,44 +295,158 @@ class SessionPanel(QWidget):
 
         layout.addWidget(group)
     
+    def on_a_changed(self, value):
+        """Handle manual a value change - preview only, no save"""
+        if self.formula_is_locked:
+            return
+        self.a = value
+        self.formula_modified = True
+        self.formula_label.setText(get_formula_string(self.a, self.b))
+        self._update_formula_style()
+        self.set_calc_button_modified(True)
+        # Send preview signal for live graph update (no save)
+        self.formula_preview.emit(self.session_type, self.a, self.b)
+    
+    def on_b_changed(self, value):
+        """Handle manual b value change - preview only, no save"""
+        if self.formula_is_locked:
+            return
+        self.b = value
+        self.formula_modified = True
+        self.formula_label.setText(get_formula_string(self.a, self.b))
+        self._update_formula_style()
+        self.set_calc_button_modified(True)
+        # Send preview signal for live graph update (no save)
+        self.formula_preview.emit(self.session_type, self.a, self.b)
+    
     def update_controls_enabled(self):
-        """Update enabled state of formula controls based on lock status"""
         enabled = not self.formula_is_locked
         self.a_spin.setEnabled(enabled)
         self.b_spin.setEnabled(enabled)
         self.auto_fit_btn.setEnabled(enabled)
-        # Calculate button still works with locked formula (just uses existing formula)
-        # Lock button itself is always enabled to allow unlocking
     
     def update_current_ratio(self, ratio: float):
-        """Update the displayed current ratio"""
         if ratio is not None:
             self.ratio_value_label.setText(f"{ratio:.6f}")
         else:
             self.ratio_value_label.setText("--")
     
     def set_formula_is_default(self, is_default: bool):
-        """Set whether the current formula is the default"""
         self.formula_is_default = is_default
         self._update_formula_style()
     
     def _update_formula_style(self):
-        """Update formula label style based on default status"""
         if self.formula_is_default:
+            self.formula_label.setStyleSheet("color: #888888; font-family: monospace; font-style: italic;")
+        elif self.formula_modified:
             self.formula_label.setStyleSheet("color: #888888; font-family: monospace; font-style: italic;")
         else:
             self.formula_label.setStyleSheet("color: #FFA500; font-family: monospace;")
     
     def on_auto_fit_clicked(self):
-        """Emit auto_fit_requested signal - only if not locked"""
         if self.formula_is_locked:
             QMessageBox.warning(self, "Formula Locked", 
                 "This formula is locked. Unlock it first to use Auto-Fit.")
             return
-        self.auto_fit_requested.emit(self.session_type)
+        
+        if not self.current_track or not self.current_vehicle_class:
+            QMessageBox.warning(self, "No Data", 
+                "No track or vehicle class selected. Please select a track and class first.")
+            return
+        
+        import sqlite3
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        
+        session_filter = self.session_type
+        cursor.execute("""
+            SELECT ratio, lap_time FROM data_points 
+            WHERE track = ? AND vehicle_class = ? AND session_type = ?
+            ORDER BY ratio
+        """, (self.current_track, self.current_vehicle_class, session_filter))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if len(rows) < 2:
+            QMessageBox.warning(self, "Insufficient Data", 
+                f"Need at least 2 data points to fit a curve.\n\n"
+                f"Found {len(rows)} points for {self.current_track}/{self.current_vehicle_class}/{self.session_type}")
+            return
+        
+        ratios = [row[0] for row in rows]
+        times = [row[1] for row in rows]
+        
+        outlier_config = get_outlier_settings()
+        min_ratio, max_ratio = get_ratio_limits()
+        
+        a, b, stats = fit_hyperbolic(
+            ratios, times,
+            fixed_a=None,
+            outlier_method=outlier_config['method'],
+            outlier_threshold=outlier_config['threshold'],
+            optimize_a=True,
+            min_ratio_limit=min_ratio,
+            max_ratio_limit=max_ratio
+        )
+        
+        if a is None or b is None:
+            a, b, stats = fit_hyperbolic(
+                ratios, times,
+                fixed_a=None,
+                outlier_method="none",
+                outlier_threshold=outlier_config['threshold'],
+                optimize_a=True,
+                min_ratio_limit=min_ratio,
+                max_ratio_limit=max_ratio
+            )
+        
+        if a is None or b is None:
+            a = DEFAULT_A_VALUE
+            b_values = []
+            for r, t in zip(ratios, times):
+                if r > 0:
+                    b_calc = t - (a / r)
+                    b_values.append(b_calc)
+            if b_values:
+                b = sum(b_values) / len(b_values)
+                from core_math import clamp_b
+                b = clamp_b(b)
+                predictions = [time_from_ratio(r, a, b) for r in ratios]
+                errors = [abs(t - p) for t, p in zip(times, predictions)]
+                stats.avg_error = sum(errors) / len(errors)
+                stats.max_error = max(errors)
+                stats.points_used = len(ratios)
+                stats.outliers_removed = 0
+        
+        dialog = AutoFitResultDialog(
+            self, self.session_type,
+            self.a, self.b,
+            a, b,
+            stats,
+            len(rows),
+            stats.outliers_removed if hasattr(stats, 'outliers_removed') else 0
+        )
+        
+        if dialog.exec_() == QDialog.Accepted and dialog.accepted_formula:
+            # Apply the new formula
+            self.a = a
+            self.b = b
+            self.a_spin.blockSignals(True)
+            self.b_spin.blockSignals(True)
+            self.a_spin.setValue(a)
+            self.b_spin.setValue(b)
+            self.a_spin.blockSignals(False)
+            self.b_spin.blockSignals(False)
+            self.formula_label.setText(get_formula_string(a, b))
+            self.formula_modified = False
+            self.formula_is_default = False
+            self._update_formula_style()
+            self.set_calc_button_modified(False)
+            # Send save signal
+            self.formula_changed.emit(self.session_type, a, b)
     
     def update_median_time(self, median_time: float):
-        """Update the displayed median time"""
         self.median_time = median_time
         if median_time is not None and median_time > 0:
             minutes = int(median_time) // 60
@@ -242,20 +466,6 @@ class SessionPanel(QWidget):
     
     def on_show_toggled(self, checked):
         self.show_data_toggled.emit(self.session_type, checked)
-        
-    def on_param_changed(self):
-        if self.formula_is_locked:
-            # This shouldn't happen because spinboxes are disabled, but just in case
-            return
-        self.a = self.a_spin.value()
-        self.b = self.b_spin.value()
-        self.formula_label.setText(get_formula_string(self.a, self.b))
-        self.formula_changed.emit(self.session_type, self.a, self.b)
-        self.set_calc_button_modified(True)
-        # When user manually edits parameters, it's no longer the default formula
-        if self.formula_is_default:
-            self.formula_is_default = False
-            self._update_formula_style()
     
     def set_calc_button_modified(self, modified: bool):
         self.calc_button_modified = modified
@@ -291,13 +501,19 @@ class SessionPanel(QWidget):
             self.current_ratio = new_ratio
             self.ratio_value_label.setText(f"{new_ratio:.6f}")
             
+            # Save the formula since user explicitly clicked Calculate Ratio
+            if self.formula_modified:
+                self.formula_modified = False
+                self.formula_is_default = False
+                self._update_formula_style()
+                self.formula_changed.emit(self.session_type, self.a, self.b)
+            
             self.calculate_ratio.emit(self.session_type, self.user_time)
             self.set_calc_button_modified(False)
         else:
             QMessageBox.warning(self, "No Time", "No user time available for this session.\n\nClick the 'Edit' button to set a lap time manually.")
     
     def on_lock_toggled(self, checked):
-        """Handle lock button toggle - simple without dialog"""
         self.formula_is_locked = checked
         
         if checked:
@@ -313,7 +529,6 @@ class SessionPanel(QWidget):
         self.lock_toggled.emit(self.session_type, checked)
             
     def set_locked_status(self, is_locked: bool):
-        """Set the locked status display from external source"""
         self.formula_is_locked = is_locked
         self.lock_btn.blockSignals(True)
         self.lock_btn.setChecked(is_locked)
@@ -329,6 +544,7 @@ class SessionPanel(QWidget):
         self.update_controls_enabled()
             
     def update_formula(self, a: float, b: float):
+        """Update formula from external source (database load)"""
         self.a = a
         self.b = b
         self.a_spin.blockSignals(True)
@@ -338,8 +554,9 @@ class SessionPanel(QWidget):
         self.a_spin.blockSignals(False)
         self.b_spin.blockSignals(False)
         self.formula_label.setText(get_formula_string(a, b))
-        self.set_calc_button_modified(False)
+        self.formula_modified = False
         self._update_formula_style()
+        self.set_calc_button_modified(False)
         
     def update_user_time(self, time_sec: float):
         self.user_time = time_sec if time_sec > 0 else None

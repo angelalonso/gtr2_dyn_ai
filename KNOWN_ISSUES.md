@@ -4,6 +4,8 @@
 
 - If you update the Ratio through the visualizer, the main dyn_ai does not get updated (but the file does).
 
+- On dyn_ai_visualizer, the first track and car combo loaded does not show data. Press "Refresh" to show it.
+
 - The import area is not stable enough; it has been barely tested.
 
 - Sometimes the visualizer does not show current data and needs the "Refresh" button to be pushed.

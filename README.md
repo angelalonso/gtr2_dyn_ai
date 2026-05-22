@@ -10,6 +10,8 @@ Dyn AI detects qualifying and race results and tunes AI to match your pace.
 The program will then automatically adjust GTR2 AI difficulty (QualRatio/RaceRatio) for each Track, based on your lap times.
 Setup and graph tools are also available (dyn_ai_setup.exe, dyn_ai_visualizer.exe).
 
+[![Watch the introduction](https://raw.githubusercontent.com/angelalonso/gtr2_dyn_ai/main/dyn_ai_thumbnail.png)](https://youtu.be/vEn2WfLAe7I)
+
 ---
 
 ## Current State

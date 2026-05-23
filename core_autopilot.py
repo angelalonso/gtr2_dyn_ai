@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from core_math import (
-    DEFAULT_A_VALUE, time_from_ratio, ratio_from_time, clamp_ratio, 
+    DEFAULT_A_VALUE, MIN_A, MAX_A, MIN_B, MAX_B, MIN_RATIO, MAX_RATIO,
+    time_from_ratio, ratio_from_time, clamp_ratio, 
     clamp_b, is_valid_formula, calculate_b_from_point, fit_hyperbolic,
     get_formula_string, calculate_error_metrics, should_suggest_manual_adjustment
 )
@@ -169,6 +170,7 @@ class Formula:
                     max_ratio_limit: float = 1.5,
                     is_locked: bool = False) -> Optional['Formula']:
         """Create formula by fitting to multiple data points"""
+        # When optimize_a is False, we keep a fixed and only fit b
         a, b, stats = fit_hyperbolic(
             ratios, times, 
             fixed_a=fixed_a,
@@ -424,6 +426,7 @@ class FormulaManager:
         return formula.lock_reason if formula else ""
     
     def update_formula_a_value(self, track: str, vehicle_class: str, session_type: str, a_value: float) -> bool:
+        """Manually update the A value - only called by user, never by autopilot"""
         formula = self.get_formula_by_class(track, vehicle_class, session_type)
         if not formula:
             return False
@@ -446,7 +449,10 @@ class FormulaManager:
     def update_formula_with_point(self, track: str, vehicle_class: str, session_type: str,
                                    ratio: float, lap_time: float,
                                    min_ratio_limit: float = 0.5, max_ratio_limit: float = 1.5) -> Optional[Formula]:
-        """Update formula by adding a new data point"""
+        """
+        Update formula by adding a new data point.
+        IMPORTANT: This only updates b (the asymptote). a remains fixed.
+        """
         existing = self.get_formula_by_class(track, vehicle_class, session_type)
         
         # Don't update if formula is locked by user
@@ -472,34 +478,32 @@ class FormulaManager:
                 ratios.append(ratio)
                 times.append(lap_time)
                 
-                # Determine if we should optimize A
-                optimize_a = len(ratios) <= 3 or existing.confidence < 0.7
-                
-                # Refit, possibly optimizing A
+                # IMPORTANT: When updating formula with new point, we KEEP A FIXED
+                # Only b is recalculated based on all data points
+                # We set fixed_a to the existing a value, and optimize_a to False
                 new_formula = Formula.from_points(
                     track, vehicle_class, session_type,
-                    ratios, times, fixed_a=None if optimize_a else existing.a,
-                    optimize_a=optimize_a,
+                    ratios, times, 
+                    fixed_a=existing.a,  # Keep a fixed to the existing value
+                    outlier_method="none",  # No outlier detection for auto-updates
+                    optimize_a=False,  # NEVER optimize a in auto-updates
                     min_ratio_limit=min_ratio_limit,
                     max_ratio_limit=max_ratio_limit,
                     is_locked=existing.is_locked
                 )
                 if new_formula:
                     self.save_formula(new_formula)
+                    logger.debug(f"Updated formula for {track}/{vehicle_class}/{session_type}: a kept at {existing.a:.4f}, b changed from {existing.b:.4f} to {new_formula.b:.4f}")
                     return new_formula
         
         # No existing formula or not enough points, create from single point
-        # For first point, calculate optimal A to hit the center
-        min_ratio, max_ratio = min_ratio_limit, max_ratio_limit
-        center_ratio = min_ratio + ((max_ratio - min_ratio) / 2)
-        optimal_a = (lap_time - MIN_B) * center_ratio
-        optimal_a = max(MIN_A, min(MAX_A, optimal_a))
-        
+        # For first point, use the default A value
         new_formula = Formula.from_point(
             track, vehicle_class, ratio, lap_time, session_type, 
-            a_value=optimal_a, is_locked=False
+            a_value=DEFAULT_A_VALUE, is_locked=False
         )
         self.save_formula(new_formula)
+        logger.debug(f"Created initial formula for {track}/{vehicle_class}/{session_type}: a={DEFAULT_A_VALUE:.4f}, b={new_formula.b:.4f}")
         return new_formula
     
     def check_formula_quality(self, track: str, vehicle_class: str, session_type: str) -> Tuple[bool, str]:
@@ -628,7 +632,7 @@ class AutopilotEngine:
             return formula
         
         if formula:
-            # Update formula with new point
+            # Update formula with new point - this only updates b, keeps a fixed
             updated = self.formula_manager.update_formula_with_point(
                 track, vehicle_class, session_type, current_ratio, target_time,
                 self._min_ratio, self._max_ratio
@@ -639,12 +643,8 @@ class AutopilotEngine:
             return formula
         else:
             logger.debug(f"Creating new formula for {track}/{vehicle_class}/{session_type}")
-            # For first point, calculate optimal A to hit the center
-            center_ratio = self._min_ratio + ((self._max_ratio - self._min_ratio) / 2)
-            optimal_a = (target_time - MIN_B) * center_ratio
-            optimal_a = max(MIN_A, min(MAX_A, optimal_a))
-            
-            new_formula = Formula.from_point(track, vehicle_class, current_ratio, target_time, session_type, optimal_a)
+            # For first point, use default A value
+            new_formula = Formula.from_point(track, vehicle_class, current_ratio, target_time, session_type, DEFAULT_A_VALUE)
             self.formula_manager.save_formula(new_formula)
             return new_formula
     
@@ -737,17 +737,10 @@ class AutopilotEngine:
             logger.debug(f"Using existing formula: a={a:.2f}, b={b:.2f}")
             result["formula"] = existing_formula
         else:
-            # For first point, calculate optimal A to hit the center
-            center_ratio = self._min_ratio + ((self._max_ratio - self._min_ratio) / 2)
-            if user_lap_time > 0 and current_ratio > 0:
-                a = (user_lap_time - MIN_B) * center_ratio
-                a = max(MIN_A, min(MAX_A, a))
-                b = calculate_b_from_point(current_ratio, user_lap_time, a)
-                logger.debug(f"No formula found, estimating a from center: a={a:.2f}, b={b:.2f}")
-            else:
-                a = DEFAULT_A_VALUE
-                b = 70.0
-                logger.debug(f"No formula found, using default a={a:.2f}, b={b:.2f}")
+            # No existing formula - use default A value
+            a = DEFAULT_A_VALUE
+            b = 70.0
+            logger.debug(f"No formula found, using default a={a:.2f}, b={b:.2f}")
         
         effective_user_time = user_lap_time
         
@@ -805,7 +798,7 @@ class AutopilotEngine:
             )
             if updated_formula:
                 result["formula"] = updated_formula
-                logger.debug(f"Updated formula with new data point")
+                logger.debug(f"Updated formula with new data point (a kept fixed at {updated_formula.a:.4f})")
                 
                 # Check formula quality and suggest manual adjustment
                 should_suggest, reason = self.formula_manager.check_formula_quality(track, vehicle_class, session_type)
@@ -922,12 +915,7 @@ class AutopilotEngine:
     def calculate_ratio_from_formula(self, track: str, vehicle_class: str, session_type: str, lap_time: float) -> Optional[float]:
         formula = self.formula_manager.get_formula_by_class(track, vehicle_class, session_type)
         if not formula:
-            # For first point, calculate optimal A to hit the center
-            center_ratio = self._min_ratio + ((self._max_ratio - self._min_ratio) / 2)
-            a = (lap_time - MIN_B) * center_ratio
-            a = max(MIN_A, min(MAX_A, a))
-            b = calculate_b_from_point(1.0, lap_time, a)
-            formula = Formula(track, vehicle_class, a, b, session_type)
+            formula = Formula(track, vehicle_class, DEFAULT_A_VALUE, 70.0, session_type)
         
         return formula.get_ratio_for_time(lap_time)
 
@@ -991,3 +979,7 @@ class AutopilotManager:
     def get_lock_reason(self, track: str, vehicle_class: str, session_type: str) -> str:
         """Get lock reason for a locked formula"""
         return self.formula_manager.get_lock_reason(track, vehicle_class, session_type)
+    
+    def update_formula_a_value(self, track: str, vehicle_class: str, session_type: str, a_value: float) -> bool:
+        """Manually update the A value - called only by user, never by autopilot"""
+        return self.formula_manager.update_formula_a_value(track, vehicle_class, session_type, a_value)

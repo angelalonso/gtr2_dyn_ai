@@ -5,6 +5,7 @@ Provides consistent track discovery across all modules
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional
 import sqlite3
@@ -120,46 +121,88 @@ def find_aiw_file_for_track(track_name: str, base_path: Path) -> Optional[Path]:
     Prioritizes exact folder name match.
     
     Args:
-        track_name: Name of the track
+        track_name: Name of the track (can be folder name or canonical ID like "Estoril/3Estoril")
         base_path: GTR2 installation path
     
     Returns:
         Path to AIW file or None if not found
     """
     if not track_name or not base_path:
+        logger.error(f"find_aiw_file_for_track: missing params - track_name={track_name}, base_path={base_path}")
         return None
     
-    locations_dir = base_path / "GameData" / "Locations"
-    if not locations_dir.exists():
-        locations_dir = base_path / "GAMEDATA" / "Locations"
+    if not base_path.exists():
+        logger.error(f"find_aiw_file_for_track: base_path does not exist: {base_path}")
+        return None
     
-    if not locations_dir.exists():
+    # Try both possible Locations directory names
+    locations_candidates = [
+        base_path / "GameData" / "Locations",
+        base_path / "GAMEDATA" / "Locations",
+    ]
+    
+    locations_dir = None
+    for candidate in locations_candidates:
+        if candidate.exists():
+            locations_dir = candidate
+            break
+    
+    if not locations_dir:
+        logger.error(f"find_aiw_file_for_track: Locations directory not found in {base_path}")
         return None
     
     track_lower = track_name.lower()
     
+    # Extract folder name if track_name is in canonical format "Folder/Stem"
+    if '/' in track_name:
+        parts = track_name.split('/')
+        folder_name = parts[0]
+        aiw_stem = parts[1] if len(parts) > 1 else folder_name
+    else:
+        folder_name = track_name
+        aiw_stem = track_name
+    
+    logger.debug(f"find_aiw_file_for_track: looking for folder='{folder_name}', stem='{aiw_stem}'")
+    
     # First, look for exact folder name match
     for track_dir in locations_dir.iterdir():
-        if track_dir.is_dir() and track_dir.name.lower() == track_lower:
-            for ext in ["*.AIW", "*.aiw"]:
-                aiw_files = list(track_dir.glob(ext))
-                if aiw_files:
-                    return aiw_files[0]
+        if track_dir.is_dir() and track_dir.name.lower() == folder_name.lower():
+            # Look for AIW file that matches the stem
+            for ext in [".AIW", ".aiw"]:
+                aiw_file = track_dir / f"{aiw_stem}{ext}"
+                if aiw_file.exists():
+                    logger.info(f"find_aiw_file_for_track: found exact match: {aiw_file}")
+                    return aiw_file
+                
+                # Also look for any AIW file in this folder if stem doesn't match
+                for aiw_file in track_dir.glob(f"*{ext}"):
+                    logger.info(f"find_aiw_file_for_track: found AIW in folder: {aiw_file}")
+                    return aiw_file
     
     # Second, look for folder where AIW stem exactly matches track name
     for track_dir in locations_dir.iterdir():
         if track_dir.is_dir():
-            for ext in ["*.AIW", "*.aiw"]:
-                for aiw_file in track_dir.glob(ext):
-                    if aiw_file.stem.lower() == track_lower:
+            for ext in [".AIW", ".aiw"]:
+                for aiw_file in track_dir.glob(f"*{ext}"):
+                    if aiw_file.stem.lower() == track_lower or aiw_file.stem.lower() == folder_name.lower():
+                        logger.info(f"find_aiw_file_for_track: found by stem match: {aiw_file}")
                         return aiw_file
     
-    # Third, look for folder name containing track name
+    # Third, look for folder name containing track name (partial match)
     for track_dir in locations_dir.iterdir():
-        if track_dir.is_dir() and track_lower in track_dir.name.lower():
-            for ext in ["*.AIW", "*.aiw"]:
-                aiw_files = list(track_dir.glob(ext))
+        if track_dir.is_dir() and (folder_name.lower() in track_dir.name.lower() or track_dir.name.lower() in folder_name.lower()):
+            for ext in [".AIW", ".aiw"]:
+                aiw_files = list(track_dir.glob(f"*{ext}"))
                 if aiw_files:
+                    logger.info(f"find_aiw_file_for_track: found by partial folder match: {aiw_files[0]}")
                     return aiw_files[0]
     
+    # Fourth, try recursive search in all Locations subdirectories
+    for ext in [".AIW", ".aiw"]:
+        for aiw_file in locations_dir.rglob(f"*{ext}"):
+            if aiw_file.stem.lower() == track_lower or aiw_file.stem.lower() == folder_name.lower():
+                logger.info(f"find_aiw_file_for_track: found by recursive search: {aiw_file}")
+                return aiw_file
+    
+    logger.warning(f"find_aiw_file_for_track: AIW file NOT found for track: {track_name}")
     return None

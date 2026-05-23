@@ -10,6 +10,8 @@ from typing import Optional
 import logging
 
 from core_math import get_formula_string
+from core_config import get_base_path
+from core_track_scanner import find_aiw_file_for_track
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +217,13 @@ class RatioPanel(tk.Frame):
     def on_edit(self):
         logger.debug(f"[RatioPanel.{self.title}] on_edit called")
         
+        # Check if we have a current track
+        if not self.main_window or not hasattr(self.main_window, 'current_track') or not self.main_window.current_track:
+            messagebox.showwarning("No Track Selected", 
+                "No track is currently selected.\n\n"
+                "Please select a track first (via the 'Select Track' button or by running a race session).")
+            return
+        
         # Get the current ratio value to edit
         edit_value = self.get_current_ratio_value()
         
@@ -223,16 +232,57 @@ class RatioPanel(tk.Frame):
         
         logger.debug(f"[RatioPanel.{self.title}] Using edit_value={edit_value}")
         
+        # Verify AIW file exists before opening dialog
+        base_path = get_base_path()
+        if not base_path or not base_path.exists():
+            messagebox.showerror("GTR2 Path Error", 
+                "GTR2 installation path is not configured or does not exist.\n\n"
+                "Please run Setup and configure the correct GTR2 path.")
+            return
+        
+        session_type = "qual" if self.title == "Quali-Ratio" else "race"
+        
+        # Use the track name directly - it should be the canonical ID
+        track_to_find = self.main_window.current_track
+        
+        logger.debug(f"[RatioPanel.{self.title}] Looking for AIW file for track: {track_to_find}")
+        
+        aiw_path = find_aiw_file_for_track(track_to_find, base_path)
+        
+        if not aiw_path or not aiw_path.exists():
+            # Also try using the track name as folder name
+            track_folder = track_to_find.split('/')[0] if '/' in track_to_find else track_to_find
+            aiw_path = find_aiw_file_for_track(track_folder, base_path)
+        
+        if not aiw_path or not aiw_path.exists():
+            messagebox.showerror("AIW File Not Found", 
+                f"Could not find AIW file for track: {track_to_find}\n\n"
+                f"Base path: {base_path}\n\n"
+                f"Please ensure:\n"
+                f"1. The track folder exists in GameData/Locations/\n"
+                f"2. The track name is correct\n\n"
+                f"Use Setup > Track Names to verify the track name.")
+            return
+        
         # Create edit dialog
         dialog = tk.Toplevel(self)
         dialog.title(f"Edit {self.title}")
-        dialog.geometry("400x300")
+        dialog.geometry("450x350")
         dialog.configure(bg='#2b2b2b')
         dialog.transient(self)
         dialog.grab_set()
         
         frame = tk.Frame(dialog, bg='#2b2b2b', padx=20, pady=20)
         frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Show track and AIW file info
+        track_info = tk.Label(frame, text=f"Track: {track_to_find}", bg='#2b2b2b', 
+                               fg='#4CAF50', font=('Arial', 10))
+        track_info.pack(anchor=tk.W, pady=(0, 5))
+        
+        aiw_info = tk.Label(frame, text=f"AIW: {aiw_path.name}", bg='#2b2b2b', 
+                             fg='#888', font=('Arial', 9))
+        aiw_info.pack(anchor=tk.W, pady=(0, 15))
         
         tk.Label(frame, text=f"Current {self.title}:", bg='#2b2b2b', fg='#888').pack()
         current_value_label = tk.Label(frame, text=f"{edit_value:.6f}", bg='#2b2b2b', fg='#4CAF50',
@@ -285,6 +335,7 @@ class RatioPanel(tk.Frame):
                 self.main_window.on_manual_edit(session, new_ratio)
             else:
                 logger.error(f"[RatioPanel.{self.title}] main_window or on_manual_edit not available")
+                messagebox.showerror("Error", "Cannot edit ratio: main window reference is missing.")
         
         tk.Button(button_frame, text="Cancel", command=dialog.destroy,
                   bg='#555', fg='white', padx=15, pady=5).pack(side=tk.LEFT, padx=5)

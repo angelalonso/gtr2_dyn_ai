@@ -24,6 +24,7 @@ from core_autopilot import get_vehicle_class, load_vehicle_classes, AutopilotMan
 from core_math import DEFAULT_A_VALUE, fit_hyperbolic, ratio_from_time, clamp_ratio, get_formula_string, calculate_b_from_point
 from core_aiw_utils import update_aiw_ratio, find_aiw_file_by_track, ensure_aiw_has_ratios
 from core_user_laptimes import UserLapTimesManager
+from core_track_scanner import find_aiw_file_for_track
 from gui_curve_graph import CurveGraphWidget
 from gui_session_panel import SessionPanel
 from gui_common import setup_dark_theme
@@ -380,15 +381,12 @@ class FormulaVisualizer(QMainWindow):
     def _on_db_file_changed(self, path: str):
         """Handle database file change - only reload if not in the middle of our own update"""
         if self._is_loading:
-            # We're in the middle of our own update, ignore this signal
             logger.debug("Ignoring db change during our own update")
             return
         
-        # Re-add the path if it was removed
         if path not in self._watcher.files() and Path(path).exists():
             self._watcher.addPath(path)
         
-        # Schedule a refresh
         self._refresh_timer.start()
 
     def _do_full_refresh(self):
@@ -439,7 +437,6 @@ class FormulaVisualizer(QMainWindow):
             
             qual_formula = self._get_formula_direct(cursor, self.current_track, self.current_vehicle_class, "qual", formula_columns)
             if qual_formula:
-                # Only update if the formula hasn't been manually modified
                 if not self.qual_panel.formula_modified:
                     self.qual_a = qual_formula[0]
                     self.qual_b = qual_formula[1]
@@ -937,7 +934,30 @@ class FormulaVisualizer(QMainWindow):
         logger.info(f"Looking for AIW file for track: {self.current_track}")
         logger.info(f"Base path: {self.base_path}")
         
-        aiw_path = find_aiw_file_by_track(self.current_track, self.base_path)
+        # Use find_aiw_file_for_track which handles both canonical and folder names
+        aiw_path = find_aiw_file_for_track(self.current_track, self.base_path)
+        
+        # If not found, try using just the folder name (first part of canonical ID)
+        if not aiw_path or not aiw_path.exists():
+            folder_name = self.current_track.split('/')[0] if '/' in self.current_track else self.current_track
+            logger.info(f"Trying folder name only: {folder_name}")
+            aiw_path = find_aiw_file_for_track(folder_name, self.base_path)
+        
+        if not aiw_path or not aiw_path.exists():
+            # Last resort: try recursive search
+            logger.info("Trying recursive search for AIW file...")
+            locations_dir = self.base_path / "GameData" / "Locations"
+            if not locations_dir.exists():
+                locations_dir = self.base_path / "GAMEDATA" / "Locations"
+            
+            if locations_dir.exists():
+                for ext in [".AIW", ".aiw"]:
+                    for aiw_file in locations_dir.rglob(f"*{ext}"):
+                        logger.info(f"Found possible AIW: {aiw_file}")
+                        aiw_path = aiw_file
+                        break
+                    if aiw_path:
+                        break
         
         if not aiw_path or not aiw_path.exists():
             QMessageBox.warning(self, "AIW Not Found", 

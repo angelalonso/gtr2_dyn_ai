@@ -21,7 +21,7 @@ def find_aiw_file_from_path(relative_path: str, base_path: Path) -> Optional[Pat
     
     Args:
         relative_path: Path like "GAMEDATA/LOCATIONS/Testtrack2/Testtrack2.AIW"
-        base_path: Base GTR2 installation path
+        base_path: GTR2 installation path
     
     Returns:
         Full Path to AIW file or None if not found
@@ -133,6 +133,7 @@ def find_aiw_file_from_path(relative_path: str, base_path: Path) -> Optional[Pat
     logger.warning(f"AIW file NOT found for path: {relative_path}")
     return None
 
+
 def find_aiw_file_by_track(track_name: str, base_path: Path) -> Optional[Path]:
     """
     Find AIW file by track name.
@@ -140,6 +141,7 @@ def find_aiw_file_by_track(track_name: str, base_path: Path) -> Optional[Path]:
     """
     from core_track_scanner import find_aiw_file_for_track
     return find_aiw_file_for_track(track_name, base_path)
+
 
 def update_aiw_ratio(aiw_path: Path, ratio_name: str, new_ratio: float, backup_dir: Optional[Path] = None) -> bool:
     """

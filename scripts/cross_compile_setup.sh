@@ -23,6 +23,7 @@ echo "Copying files to ${COMPILEDIR}..."
 cp core_config.py ${COMPILEDIR}/
 cp core_database.py ${COMPILEDIR}/
 cp core_log_manager.py ${COMPILEDIR}/
+cp core_track_scanner.py ${COMPILEDIR}/
 cp core_track_utils.py ${COMPILEDIR}/
 cp core_vehicle_scanner.py ${COMPILEDIR}/
 cp gui_setup_cfg.py ${COMPILEDIR}/
@@ -66,6 +67,7 @@ wine python -m PyInstaller \
     --hidden-import=core_config \
     --hidden-import=core_database \
     --hidden-import=core_log_manager \
+    --hidden-import=core_track_scanner \
     --hidden-import=core_track_utils \
     --hidden-import=core_vehicle_scanner \
     --hidden-import=gui_setup_cfg \

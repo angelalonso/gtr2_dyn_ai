@@ -361,13 +361,16 @@ class MainWindowTk:
             self.track_label.config(text=selected_track)
             self.root.title(f"GTR2 Dynamic AI - {selected_track}")
             
-            # Verify AIW file exists
+            # Verify AIW file exists and store its path
             from core_track_scanner import find_aiw_file_for_track
             aiw_path = find_aiw_file_for_track(selected_track, base_path)
             if aiw_path:
                 logger.info(f"Found AIW file: {aiw_path}")
+                # Store the AIW path for this track to avoid repeated lookups
+                self.current_track_aiw_path = aiw_path
             else:
                 logger.warning(f"No AIW file found for track: {selected_track}")
+                self.current_track_aiw_path = None
             
             # Load AI times for this track
             self.qual_best_ai, self.qual_worst_ai = self.get_ai_times_for_track(selected_track, "qual")
@@ -463,7 +466,11 @@ class MainWindowTk:
             logger.warning("load_aiw_ratios: no current track")
             return
         
-        aiw_path = self.find_aiw_file(self.current_track)
+        # Use the cached AIW path if available
+        aiw_path = getattr(self, 'current_track_aiw_path', None)
+        if not aiw_path or not aiw_path.exists():
+            aiw_path = self.find_aiw_file(self.current_track)
+        
         logger.debug(f"load_aiw_ratios: aiw_path={aiw_path}")
         
         if not aiw_path or not aiw_path.exists():
@@ -503,7 +510,13 @@ class MainWindowTk:
             logger.error("find_aiw_file: No base path configured")
             return None
         
-        return find_aiw_file_for_track(track_name, base_path)
+        aiw_path = find_aiw_file_for_track(track_name, base_path)
+        
+        # Cache the result for this track
+        if aiw_path and aiw_path.exists():
+            self.current_track_aiw_path = aiw_path
+        
+        return aiw_path
 
     def read_aiw_ratios(self, aiw_path: Path) -> tuple:
         qual_ratio = None
@@ -581,8 +594,16 @@ class MainWindowTk:
             self.update_formulas_from_autopilot()
             self.update_display()
     
-    def on_manual_edit(self, session_type: str, new_ratio: float):
-        logger.info(f"on_manual_edit called: session={session_type}, new_ratio={new_ratio}")
+    def on_manual_edit(self, session_type: str, new_ratio: float, aiw_path: Path = None):
+        """
+        Handle manual edit of a ratio.
+        
+        Args:
+            session_type: 'qual' or 'race'
+            new_ratio: The new ratio value to set
+            aiw_path: Optional pre-resolved AIW path (from the dialog)
+        """
+        logger.info(f"on_manual_edit called: session={session_type}, new_ratio={new_ratio}, aiw_path={aiw_path}")
         
         if self.autoratio_enabled:
             messagebox.showwarning("Auto-Ratio Enabled", 
@@ -598,8 +619,10 @@ class MainWindowTk:
                 f"You may need to run a session on that Track before you can modify its Ratio!")
             return
 
-        # Find the AIW file
-        aiw_path = self.find_aiw_file(self.current_track)
+        # Use the provided AIW path if available (from the dialog)
+        if aiw_path is None or not aiw_path.exists():
+            # Fall back to finding it
+            aiw_path = self.find_aiw_file(self.current_track)
         
         if not aiw_path:
             logger.error(f"on_manual_edit: AIW file not found for track {self.current_track}")
@@ -638,7 +661,7 @@ class MainWindowTk:
         
         # Write to AIW file
         if update_aiw_ratio(aiw_path, ratio_name, clamped_ratio, self.backup_dir):
-            logger.info(f"Successfully updated {ratio_name} to {clamped_ratio:.6f}")
+            logger.info(f"Successfully updated {ratio_name} to {clamped_ratio:.6f} in {aiw_path}")
             
             if session_type == "qual":
                 self.last_qual_ratio = clamped_ratio
@@ -668,7 +691,10 @@ class MainWindowTk:
                 messagebox.showwarning("Cannot Revert", "No previous ratio value available to revert to.")
                 return
             
-            aiw_path = self.find_aiw_file(self.current_track)
+            aiw_path = getattr(self, 'current_track_aiw_path', None)
+            if not aiw_path or not aiw_path.exists():
+                aiw_path = self.find_aiw_file(self.current_track)
+            
             if not aiw_path or not aiw_path.exists():
                 messagebox.showerror("AIW Not Found", "Could not find AIW file to revert.")
                 return
@@ -689,7 +715,10 @@ class MainWindowTk:
                 messagebox.showwarning("Cannot Revert", "No previous ratio value available to revert to.")
                 return
             
-            aiw_path = self.find_aiw_file(self.current_track)
+            aiw_path = getattr(self, 'current_track_aiw_path', None)
+            if not aiw_path or not aiw_path.exists():
+                aiw_path = self.find_aiw_file(self.current_track)
+            
             if not aiw_path or not aiw_path.exists():
                 messagebox.showerror("AIW Not Found", "Could not find AIW file to revert.")
                 return
@@ -755,6 +784,9 @@ class MainWindowTk:
         # Schedule UI updates on the main thread
         if track_name:
             self.root.after(0, lambda: self._update_track(track_name))
+            # Also update the cached AIW path from the race data
+            if aiw_path and aiw_path.exists():
+                self.root.after(0, lambda: setattr(self, 'current_track_aiw_path', aiw_path))
         
         if user_qualifying_sec:
             self.root.after(0, lambda: self._update_user_qualifying(user_qualifying_sec))

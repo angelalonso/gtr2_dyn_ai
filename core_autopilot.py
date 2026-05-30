@@ -18,7 +18,8 @@ from core_math import (
     DEFAULT_A_VALUE, MIN_A, MAX_A, MIN_B, MAX_B, MIN_RATIO, MAX_RATIO,
     time_from_ratio, ratio_from_time, clamp_ratio, 
     clamp_b, is_valid_formula, calculate_b_from_point, fit_hyperbolic,
-    get_formula_string, calculate_error_metrics, should_suggest_manual_adjustment
+    get_formula_string, calculate_error_metrics, should_suggest_manual_adjustment,
+    calculate_data_quality_metrics
 )
 from core_database import CurveDatabase
 from core_data_extraction import RaceData
@@ -118,6 +119,9 @@ class Formula:
     is_locked: bool = False
     locked_by_user: bool = False
     lock_reason: str = ""
+    quality_score: float = 0.0
+    distinct_ratio_groups: int = 0
+    ratio_spread: float = 0.0
     
     def get_time_at_ratio(self, ratio: float) -> float:
         """Calculate time from ratio using the formula"""
@@ -156,7 +160,10 @@ class Formula:
             data_points_used=1,
             vehicles_in_class={vehicle_class},
             is_locked=is_locked,
-            locked_by_user=is_locked
+            locked_by_user=is_locked,
+            distinct_ratio_groups=1,
+            ratio_spread=0.0,
+            quality_score=0.3
         )
     
     @classmethod
@@ -187,16 +194,26 @@ class Formula:
         # Calculate error metrics for confidence
         error_metrics = calculate_error_metrics(ratios, times, a, b)
         
-        # Determine confidence based on R-squared
+        # Calculate data quality metrics
+        quality_metrics = calculate_data_quality_metrics(ratios, times)
+        
+        # Determine confidence based on R-squared and data quality
         r_squared = error_metrics.get('r_squared', 0)
+        quality_score = quality_metrics.get('quality_score', 0)
+        
+        # Combined confidence: 70% fit quality, 30% data quality
+        fit_confidence = 0.0
         if r_squared >= 0.95:
-            confidence = 0.95
+            fit_confidence = 0.95
         elif r_squared >= 0.85:
-            confidence = 0.85
+            fit_confidence = 0.85
         elif r_squared >= 0.70:
-            confidence = 0.70
+            fit_confidence = 0.70
         else:
-            confidence = 0.50
+            fit_confidence = 0.50
+        
+        confidence = (fit_confidence * 0.7) + (quality_score * 0.3)
+        confidence = min(0.95, max(0.3, confidence))
         
         return cls(
             track=track,
@@ -210,7 +227,10 @@ class Formula:
             max_error=stats.max_error,
             vehicles_in_class={vehicle_class},
             is_locked=is_locked,
-            locked_by_user=is_locked
+            locked_by_user=is_locked,
+            quality_score=quality_score,
+            distinct_ratio_groups=quality_metrics.get('distinct_ratio_groups', 0),
+            ratio_spread=quality_metrics.get('ratio_spread', 0.0)
         )
 
 
@@ -244,7 +264,10 @@ class FormulaManager:
                 a_value REAL DEFAULT 32.0,
                 is_locked INTEGER DEFAULT 0,
                 locked_by_user INTEGER DEFAULT 0,
-                lock_reason TEXT DEFAULT ''
+                lock_reason TEXT DEFAULT '',
+                quality_score REAL DEFAULT 0.0,
+                distinct_ratio_groups INTEGER DEFAULT 0,
+                ratio_spread REAL DEFAULT 0.0
             )
         """)
         
@@ -258,6 +281,12 @@ class FormulaManager:
             cursor.execute("ALTER TABLE formulas ADD COLUMN locked_by_user INTEGER DEFAULT 0")
         if 'lock_reason' not in columns:
             cursor.execute("ALTER TABLE formulas ADD COLUMN lock_reason TEXT DEFAULT ''")
+        if 'quality_score' not in columns:
+            cursor.execute("ALTER TABLE formulas ADD COLUMN quality_score REAL DEFAULT 0.0")
+        if 'distinct_ratio_groups' not in columns:
+            cursor.execute("ALTER TABLE formulas ADD COLUMN distinct_ratio_groups INTEGER DEFAULT 0")
+        if 'ratio_spread' not in columns:
+            cursor.execute("ALTER TABLE formulas ADD COLUMN ratio_spread REAL DEFAULT 0.0")
         
         conn.commit()
         conn.close()
@@ -269,7 +298,8 @@ class FormulaManager:
         cursor.execute("""
             SELECT track, vehicle_class, a, b, session_type, confidence, 
                    data_points_used, avg_error, max_error, vehicles_in_class, a_value,
-                   is_locked, locked_by_user, lock_reason
+                   is_locked, locked_by_user, lock_reason, quality_score,
+                   distinct_ratio_groups, ratio_spread
             FROM formulas
         """)
         rows = cursor.fetchall()
@@ -283,12 +313,17 @@ class FormulaManager:
             is_locked = bool(row[11]) if len(row) > 11 else False
             locked_by_user = bool(row[12]) if len(row) > 12 else False
             lock_reason = row[13] if len(row) > 13 else ""
+            quality_score = row[14] if len(row) > 14 else 0.0
+            distinct_ratio_groups = row[15] if len(row) > 15 else 0
+            ratio_spread = row[16] if len(row) > 16 else 0.0
             
             formula = Formula(
                 track=row[0], vehicle_class=row[1], a=row[2], b=row[3],
                 session_type=row[4], confidence=row[5], data_points_used=row[6],
                 avg_error=row[7], max_error=row[8], vehicles_in_class=vehicles_set,
-                is_locked=is_locked, locked_by_user=locked_by_user, lock_reason=lock_reason
+                is_locked=is_locked, locked_by_user=locked_by_user, lock_reason=lock_reason,
+                quality_score=quality_score, distinct_ratio_groups=distinct_ratio_groups,
+                ratio_spread=ratio_spread
             )
             if formula.is_valid():
                 if formula.track not in self._formulas:
@@ -348,13 +383,15 @@ class FormulaManager:
             INSERT OR REPLACE INTO formulas 
             (track, vehicle_class, a, b, session_type, confidence, data_points_used, 
              avg_error, max_error, vehicles_in_class, last_used, a_value,
-             is_locked, locked_by_user, lock_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+             is_locked, locked_by_user, lock_reason, quality_score,
+             distinct_ratio_groups, ratio_spread)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
         """, (
             formula.track, formula.vehicle_class, formula.a, formula.b, 
             formula.session_type, formula.confidence, formula.data_points_used,
             formula.avg_error, formula.max_error, vehicles_str, formula.a,
-            1 if formula.is_locked else 0, 1 if formula.locked_by_user else 0, formula.lock_reason
+            1 if formula.is_locked else 0, 1 if formula.locked_by_user else 0, formula.lock_reason,
+            formula.quality_score, formula.distinct_ratio_groups, formula.ratio_spread
         ))
         conn.commit()
         conn.close()
@@ -388,7 +425,10 @@ class FormulaManager:
             vehicles_in_class=formula.vehicles_in_class,
             is_locked=True,
             locked_by_user=True,
-            lock_reason=reason
+            lock_reason=reason,
+            quality_score=formula.quality_score,
+            distinct_ratio_groups=formula.distinct_ratio_groups,
+            ratio_spread=formula.ratio_spread
         )
         return self.save_formula(new_formula)
     
@@ -411,7 +451,10 @@ class FormulaManager:
             vehicles_in_class=formula.vehicles_in_class,
             is_locked=False,
             locked_by_user=False,
-            lock_reason=""
+            lock_reason="",
+            quality_score=formula.quality_score,
+            distinct_ratio_groups=formula.distinct_ratio_groups,
+            ratio_spread=formula.ratio_spread
         )
         return self.save_formula(new_formula)
     
@@ -442,7 +485,10 @@ class FormulaManager:
             vehicles_in_class=formula.vehicles_in_class,
             is_locked=formula.is_locked,
             locked_by_user=formula.locked_by_user,
-            lock_reason=formula.lock_reason
+            lock_reason=formula.lock_reason,
+            quality_score=formula.quality_score,
+            distinct_ratio_groups=formula.distinct_ratio_groups,
+            ratio_spread=formula.ratio_spread
         )
         return self.save_formula(new_formula)
     
@@ -529,7 +575,31 @@ class FormulaManager:
         times = [r[1] for r in rows]
         
         error_metrics = calculate_error_metrics(ratios, times, formula.a, formula.b)
-        return should_suggest_manual_adjustment(error_metrics, len(rows))
+        # Pass the ratios to the quality check function
+        return should_suggest_manual_adjustment(error_metrics, len(rows), ratios)
+    
+    def get_quality_suggestion(self, track: str, vehicle_class: str, session_type: str) -> str:
+        """Get a human-readable quality suggestion for a formula"""
+        formula = self.get_formula_by_class(track, vehicle_class, session_type)
+        if not formula or formula.data_points_used < 2:
+            return "Insufficient data for quality assessment"
+        
+        # Get all data points for this combo
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ratio, lap_time FROM data_points 
+            WHERE track = ? AND vehicle_class = ? AND session_type = ?
+        """, (track, vehicle_class, session_type))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if len(rows) < 2:
+            return "Insufficient data for quality assessment"
+        
+        ratios = [r[0] for r in rows]
+        quality_metrics = calculate_data_quality_metrics(ratios, [0] * len(ratios))
+        return quality_metrics.get('suggestion', '')
 
 
 class AutopilotEngine:
@@ -983,3 +1053,7 @@ class AutopilotManager:
     def update_formula_a_value(self, track: str, vehicle_class: str, session_type: str, a_value: float) -> bool:
         """Manually update the A value - called only by user, never by autopilot"""
         return self.formula_manager.update_formula_a_value(track, vehicle_class, session_type, a_value)
+    
+    def get_quality_suggestion(self, track: str, vehicle_class: str, session_type: str) -> str:
+        """Get a human-readable quality suggestion for a formula"""
+        return self.formula_manager.get_quality_suggestion(track, vehicle_class, session_type)

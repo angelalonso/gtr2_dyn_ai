@@ -8,10 +8,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional
 import logging
+from pathlib import Path
 
 from core_math import get_formula_string
 from core_config import get_base_path
 from core_track_scanner import find_aiw_file_for_track
+from core_track_utils import normalize_track_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -242,32 +244,58 @@ class RatioPanel(tk.Frame):
         
         session_type = "qual" if self.title == "Quali-Ratio" else "race"
         
-        # Use the track name directly - it should be the canonical ID
-        track_to_find = self.main_window.current_track
+        # Get the track name from main window - this should be the canonical ID
+        track_canonical = self.main_window.current_track
+        logger.debug(f"[RatioPanel.{self.title}] Looking for AIW file for track canonical ID: {track_canonical}")
         
-        logger.debug(f"[RatioPanel.{self.title}] Looking for AIW file for track: {track_to_find}")
+        # Try to find the AIW file using the canonical ID first
+        aiw_path = find_aiw_file_for_track(track_canonical, base_path)
         
-        aiw_path = find_aiw_file_for_track(track_to_find, base_path)
-        
+        # If not found, try to extract folder name from canonical ID
+        folder_name = track_canonical.split('/')[0] if '/' in track_canonical else track_canonical
         if not aiw_path or not aiw_path.exists():
-            # Also try using the track name as folder name
-            track_folder = track_to_find.split('/')[0] if '/' in track_to_find else track_to_find
-            aiw_path = find_aiw_file_for_track(track_folder, base_path)
+            logger.debug(f"[RatioPanel.{self.title}] Trying folder name only: {folder_name}")
+            aiw_path = find_aiw_file_for_track(folder_name, base_path)
+        
+        # If still not found, try a recursive search in Locations
+        if not aiw_path or not aiw_path.exists():
+            logger.debug(f"[RatioPanel.{self.title}] Trying recursive search for AIW file...")
+            locations_dir = base_path / "GameData" / "Locations"
+            if not locations_dir.exists():
+                locations_dir = base_path / "GAMEDATA" / "Locations"
+            
+            if locations_dir.exists():
+                track_lower = track_canonical.lower()
+                folder_lower = folder_name.lower()
+                for ext in [".AIW", ".aiw"]:
+                    for candidate in locations_dir.rglob(f"*{ext}"):
+                        candidate_stem_lower = candidate.stem.lower()
+                        if (candidate_stem_lower == track_lower or 
+                            candidate_stem_lower == folder_lower or
+                            track_lower.endswith(candidate_stem_lower) or
+                            candidate_stem_lower.endswith(track_lower)):
+                            logger.debug(f"[RatioPanel.{self.title}] Found AIW via recursive search: {candidate}")
+                            aiw_path = candidate
+                            break
+                    if aiw_path:
+                        break
         
         if not aiw_path or not aiw_path.exists():
             messagebox.showerror("AIW File Not Found", 
-                f"Could not find AIW file for track: {track_to_find}\n\n"
+                f"Could not find AIW file for track: {track_canonical}\n\n"
                 f"Base path: {base_path}\n\n"
                 f"Please ensure:\n"
                 f"1. The track folder exists in GameData/Locations/\n"
-                f"2. The track name is correct\n\n"
-                f"Use Setup > Track Names to verify the track name.")
+                f"2. The track name in the database matches the actual folder name\n\n"
+                f"Use Setup > Track Names to verify or rename the track entry.")
             return
+        
+        logger.info(f"[RatioPanel.{self.title}] Found AIW file: {aiw_path}")
         
         # Create edit dialog
         dialog = tk.Toplevel(self)
         dialog.title(f"Edit {self.title}")
-        dialog.geometry("450x350")
+        dialog.geometry("450x400")
         dialog.configure(bg='#2b2b2b')
         dialog.transient(self)
         dialog.grab_set()
@@ -276,13 +304,21 @@ class RatioPanel(tk.Frame):
         frame.pack(fill=tk.BOTH, expand=True)
         
         # Show track and AIW file info
-        track_info = tk.Label(frame, text=f"Track: {track_to_find}", bg='#2b2b2b', 
+        track_info = tk.Label(frame, text=f"Track: {track_canonical}", bg='#2b2b2b', 
                                fg='#4CAF50', font=('Arial', 10))
         track_info.pack(anchor=tk.W, pady=(0, 5))
         
         aiw_info = tk.Label(frame, text=f"AIW: {aiw_path.name}", bg='#2b2b2b', 
                              fg='#888', font=('Arial', 9))
         aiw_info.pack(anchor=tk.W, pady=(0, 15))
+        
+        # Warning if the AIW name doesn't match the track name
+        aiw_stem = aiw_path.stem.lower()
+        track_lower = track_canonical.lower()
+        if aiw_stem not in track_lower and track_lower not in aiw_stem:
+            warning_label = tk.Label(frame, text="Warning: AIW filename does not match track name!", 
+                                      bg='#2b2b2b', fg='#FFA500', font=('Arial', 9, 'bold'))
+            warning_label.pack(anchor=tk.W, pady=(0, 10))
         
         tk.Label(frame, text=f"Current {self.title}:", bg='#2b2b2b', fg='#888').pack()
         current_value_label = tk.Label(frame, text=f"{edit_value:.6f}", bg='#2b2b2b', fg='#4CAF50',
@@ -303,14 +339,14 @@ class RatioPanel(tk.Frame):
         spinbox.insert(0, f"{edit_value:.6f}")
         
         # Preview label
-        preview_var = tk.StringVar(value=f"Will write: {edit_value:.6f}")
+        preview_var = tk.StringVar(value=f"Will write to: {aiw_path.name}\nWill write value: {edit_value:.6f}")
         preview_label = tk.Label(frame, textvariable=preview_var, bg='#2b2b2b', fg='#888', font=('Arial', 9))
         preview_label.pack(pady=10)
         
         def on_spin_change(*args):
             try:
                 val = float(spinbox.get())
-                preview_var.set(f"Will write: {val:.6f}")
+                preview_var.set(f"Will write to: {aiw_path.name}\nWill write value: {val:.6f}")
             except ValueError:
                 pass
         
@@ -332,7 +368,8 @@ class RatioPanel(tk.Frame):
             dialog.destroy()
             if self.main_window and hasattr(self.main_window, 'on_manual_edit'):
                 session = "qual" if self.title == "Quali-Ratio" else "race"
-                self.main_window.on_manual_edit(session, new_ratio)
+                # Pass the AIW path as well to ensure the correct file is updated
+                self.main_window.on_manual_edit(session, new_ratio, aiw_path)
             else:
                 logger.error(f"[RatioPanel.{self.title}] main_window or on_manual_edit not available")
                 messagebox.showerror("Error", "Cannot edit ratio: main window reference is missing.")

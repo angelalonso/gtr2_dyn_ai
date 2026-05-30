@@ -14,7 +14,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from core_config import get_ratio_limits, get_outlier_settings
 from core_math import (
     DEFAULT_A_VALUE, time_from_ratio, ratio_from_time, clamp_ratio, 
-    get_formula_string, fit_hyperbolic, MAX_B
+    get_formula_string, fit_hyperbolic, MAX_B, calculate_data_quality_metrics
 )
 from gui_common_dialogs import ManualLapTimeDialog
 
@@ -23,7 +23,8 @@ class AutoFitResultDialog(QDialog):
     """Dialog showing Auto-Fit results and asking for acceptance"""
     
     def __init__(self, parent, session_type: str, old_a: float, old_b: float, 
-                 new_a: float, new_b: float, stats, points_count: int, outliers_removed: int):
+                 new_a: float, new_b: float, stats, points_count: int, outliers_removed: int,
+                 quality_suggestion: str = ""):
         super().__init__(parent)
         self.session_type = session_type
         self.old_a = old_a
@@ -33,11 +34,12 @@ class AutoFitResultDialog(QDialog):
         self.stats = stats
         self.points_count = points_count
         self.outliers_removed = outliers_removed
+        self.quality_suggestion = quality_suggestion
         self.accepted_formula = False
         
         self.setWindowTitle(f"Auto-Fit Results - {session_type.upper()}")
         self.setMinimumWidth(500)
-        self.setMinimumHeight(400)
+        self.setMinimumHeight(420)
         self.setup_ui()
     
     def setup_ui(self):
@@ -98,6 +100,17 @@ class AutoFitResultDialog(QDialog):
         
         layout.addWidget(stats_group)
         
+        if self.quality_suggestion:
+            quality_group = QGroupBox("Data Quality Assessment")
+            quality_layout = QVBoxLayout(quality_group)
+            
+            suggestion_label = QLabel(self.quality_suggestion)
+            suggestion_label.setWordWrap(True)
+            suggestion_label.setStyleSheet("color: #FFA500;")
+            quality_layout.addWidget(suggestion_label)
+            
+            layout.addWidget(quality_group)
+        
         if self.outliers_removed > 0:
             warning_label = QLabel(
                 f"Warning: {self.outliers_removed} outlier(s) were detected and excluded from the fit.\n"
@@ -152,6 +165,9 @@ class SessionPanel(QWidget):
         self.formula_is_default = True
         self.formula_is_locked = False
         self.formula_modified = False
+        self.quality_suggestion = ""
+        self.distinct_ratios = 0
+        self.ratio_spread = 0.0
         
         self.current_track = ""
         self.current_vehicle_class = ""
@@ -161,6 +177,26 @@ class SessionPanel(QWidget):
     def set_current_track_class(self, track: str, vehicle_class: str):
         self.current_track = track
         self.current_vehicle_class = vehicle_class
+        self.update_quality_suggestion()
+    
+    def update_quality_suggestion(self):
+        """Update the quality suggestion from the database"""
+        if not self.current_track or not self.current_vehicle_class:
+            return
+        
+        from core_autopilot import AutopilotManager
+        if hasattr(self.parent(), 'autopilot_manager'):
+            suggestion = self.parent().autopilot_manager.get_quality_suggestion(
+                self.current_track, self.current_vehicle_class, self.session_type
+            )
+            self.quality_suggestion = suggestion
+            
+            # Also update the accuracy display with the suggestion
+            if hasattr(self, 'accuracy_label') and hasattr(self, 'accuracy_frame'):
+                if suggestion and suggestion != "Insufficient data for quality assessment":
+                    current_text = self.accuracy_label.text()
+                    if "points" in current_text:
+                        self.accuracy_label.setText(f"{current_text}\n{suggestion}")
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -257,7 +293,7 @@ class SessionPanel(QWidget):
 
         row2.addWidget(QLabel("b:"))
         self.b_spin = QDoubleSpinBox()
-        self.b_spin.setRange(0.01, MAX_B)  # Use MAX_B from core_math
+        self.b_spin.setRange(0.01, MAX_B)
         self.b_spin.setDecimals(3)
         self.b_spin.setValue(self.b)
         self.b_spin.setFixedWidth(80)
@@ -293,7 +329,69 @@ class SessionPanel(QWidget):
         row4.addStretch()
         group_layout.addLayout(row4)
 
+        self.accuracy_frame = QGroupBox("Data Quality")
+        self.accuracy_frame.setStyleSheet("QGroupBox { color: #888; margin-top: 4px; padding-top: 4px; }")
+        accuracy_layout = QVBoxLayout(self.accuracy_frame)
+        accuracy_layout.setSpacing(2)
+        accuracy_layout.setContentsMargins(6, 6, 6, 6)
+        
+        self.accuracy_label = QLabel("No data")
+        self.accuracy_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.accuracy_label.setWordWrap(True)
+        accuracy_layout.addWidget(self.accuracy_label)
+        
+        self.progress_bar = None
+        
+        group_layout.addWidget(self.accuracy_frame)
+        
         layout.addWidget(group)
+    
+    def update_accuracy_display(self, confidence: float = None, data_points_used: int = 0,
+                                avg_error: float = None, max_error: float = None,
+                                outliers: int = 0):
+        """Update the accuracy display with data quality information"""
+        if data_points_used == 0:
+            self.accuracy_frame.setVisible(False)
+            return
+        
+        self.accuracy_frame.setVisible(True)
+        
+        if confidence is None:
+            confidence = 0.5
+        
+        if confidence >= 0.8:
+            color = "#4CAF50"
+            quality_text = "Excellent"
+        elif confidence >= 0.6:
+            color = "#FFC107"
+            quality_text = "Good"
+        elif confidence >= 0.4:
+            color = "#FF9800"
+            quality_text = "Fair"
+        else:
+            color = "#f44336"
+            quality_text = "Poor"
+        
+        percent = int(confidence * 100)
+        
+        quality_info = f"Fit: {quality_text} ({percent}%)"
+        
+        if self.distinct_ratios > 0:
+            quality_info += f" | Ratios: {self.distinct_ratios} distinct groups"
+        else:
+            quality_info += f" | Points: {data_points_used}"
+        
+        if self.ratio_spread > 0:
+            quality_info += f" | Spread: {self.ratio_spread:.3f}"
+        
+        if avg_error is not None and avg_error > 0:
+            quality_info += f"\nAvg error: {avg_error:.2f}s"
+        
+        if self.quality_suggestion and self.quality_suggestion != "Insufficient data for quality assessment":
+            quality_info += f"\n{self.quality_suggestion}"
+        
+        self.accuracy_label.setText(quality_info)
+        self.accuracy_label.setStyleSheet(f"color: {color}; font-size: 10px;")
     
     def on_a_changed(self, value):
         """Handle manual a value change - preview only, no save"""
@@ -377,6 +475,12 @@ class SessionPanel(QWidget):
         ratios = [row[0] for row in rows]
         times = [row[1] for row in rows]
         
+        # Calculate data quality metrics
+        quality_metrics = calculate_data_quality_metrics(ratios, times)
+        quality_suggestion = quality_metrics.get('suggestion', '')
+        self.distinct_ratios = quality_metrics.get('distinct_ratio_groups', 0)
+        self.ratio_spread = quality_metrics.get('ratio_spread', 0.0)
+        
         outlier_config = get_outlier_settings()
         min_ratio, max_ratio = get_ratio_limits()
         
@@ -425,7 +529,8 @@ class SessionPanel(QWidget):
             a, b,
             stats,
             len(rows),
-            stats.outliers_removed if hasattr(stats, 'outliers_removed') else 0
+            stats.outliers_removed if hasattr(stats, 'outliers_removed') else 0,
+            quality_suggestion
         )
         
         if dialog.exec_() == QDialog.Accepted and dialog.accepted_formula:
@@ -445,6 +550,16 @@ class SessionPanel(QWidget):
             self.set_calc_button_modified(False)
             # Send save signal
             self.formula_changed.emit(self.session_type, a, b)
+        
+        # Update the accuracy display with quality info
+        self.quality_suggestion = quality_suggestion
+        self.update_accuracy_display(
+            confidence=(stats.avg_error if stats else 1.0),
+            data_points_used=len(rows),
+            avg_error=stats.avg_error if stats else 0,
+            max_error=stats.max_error if stats else 0,
+            outliers=stats.outliers_removed if stats else 0
+        )
     
     def update_median_time(self, median_time: float):
         self.median_time = median_time
@@ -574,3 +689,9 @@ class SessionPanel(QWidget):
         self.show_checkbox.blockSignals(True)
         self.show_checkbox.setChecked(show)
         self.show_checkbox.blockSignals(False)
+    
+    def update_accuracy(self, confidence: float, data_points_used: int,
+                        avg_error: float = None, max_error: float = None,
+                        outliers: int = 0):
+        """Legacy method - now uses update_accuracy_display"""
+        self.update_accuracy_display(confidence, data_points_used, avg_error, max_error, outliers)

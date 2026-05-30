@@ -13,7 +13,7 @@ DEFAULT_A_VALUE = 32.0
 MIN_RATIO = 0.3
 MAX_RATIO = 3.0
 MIN_B = 10.0
-MAX_B = 2000.0  # Increased from 200 to 2000
+MAX_B = 2000.0
 MIN_A = 1.0
 MAX_A = 300.0
 
@@ -232,6 +232,91 @@ def calculate_error_weighted_a(
             best_a = a_candidate
     
     return clamp_a(best_a), best_error, center_ratio
+
+
+def calculate_data_quality_metrics(ratios: List[float], times: List[float]) -> Dict[str, any]:
+    """
+    Calculate comprehensive data quality metrics.
+    
+    Returns:
+        Dictionary with:
+        - distinct_ratio_groups: Number of distinct ratio groups (within 0.02 tolerance)
+        - ratio_spread: Max ratio - min ratio
+        - effective_points: Weighted count that accounts for ratio variety
+        - quality_score: 0-1 score based on distinct ratios and spread
+        - suggestion: Human-readable quality assessment
+    """
+    if not ratios:
+        return {
+            'distinct_ratio_groups': 0,
+            'ratio_spread': 0.0,
+            'effective_points': 0,
+            'quality_score': 0.0,
+            'suggestion': 'No data points'
+        }
+    
+    # Group ratios that are very close (within 2% of typical ratio range)
+    # This prevents counting 10 points at the exact same ratio as 10 distinct points
+    tolerance = 0.02
+    ratio_groups = []
+    for r in ratios:
+        found = False
+        for group in ratio_groups:
+            if abs(r - group['center']) <= tolerance:
+                group['count'] += 1
+                group['center'] = (group['center'] * (group['count'] - 1) + r) / group['count']
+                found = True
+                break
+        if not found:
+            ratio_groups.append({'center': r, 'count': 1})
+    
+    distinct_groups = len(ratio_groups)
+    max_group_count = max((g['count'] for g in ratio_groups), default=0)
+    
+    # Calculate spread (max ratio - min ratio)
+    ratio_spread = max(ratios) - min(ratios)
+    
+    # Calculate effective points: each distinct ratio group contributes 
+    # diminishing returns for additional points at same ratio
+    # Formula: 1 + log2(count) for each group, capped at 3
+    effective_points = 0
+    for group in ratio_groups:
+        group_effective = 1.0
+        if group['count'] > 1:
+            group_effective += min(2.0, np.log2(group['count']))
+        effective_points += group_effective
+    
+    # Quality score (0-1) based on:
+    # - Distinct ratio groups (max 8 groups considered sufficient)
+    # - Ratio spread (larger spread is better, max 1.0 considered sufficient)
+    groups_score = min(1.0, distinct_groups / 8.0)
+    spread_score = min(1.0, ratio_spread / 1.0)
+    
+    quality_score = (groups_score * 0.6) + (spread_score * 0.4)
+    quality_score = min(1.0, quality_score)
+    
+    # Generate human-readable suggestion
+    if distinct_groups == 1:
+        suggestion = f"Only one distinct ratio group. Add data at different ratios to define the curve shape."
+    elif distinct_groups == 2:
+        suggestion = f"Only two distinct ratio groups ({ratio_spread:.3f} spread). More ratio variety will improve accuracy."
+    elif distinct_groups < 5:
+        suggestion = f"Good variety with {distinct_groups} ratio groups, but more will help."
+    else:
+        suggestion = f"Excellent ratio variety with {distinct_groups} groups (spread: {ratio_spread:.3f})"
+    
+    if ratio_spread < 0.2:
+        suggestion += f" Ratio spread is small ({ratio_spread:.3f}). Points are too clustered."
+    
+    return {
+        'distinct_ratio_groups': distinct_groups,
+        'ratio_spread': ratio_spread,
+        'effective_points': effective_points,
+        'quality_score': quality_score,
+        'suggestion': suggestion,
+        'total_points': len(ratios),
+        'max_group_count': max_group_count
+    }
 
 
 def calculate_error_metrics(
@@ -615,13 +700,16 @@ def get_formula_string(a: float, b: float) -> str:
     return f"T = {a:.4f} / R + {b:.4f}"
 
 
-def should_suggest_manual_adjustment(error_metrics: Dict[str, float], points_count: int) -> Tuple[bool, str]:
+def should_suggest_manual_adjustment(error_metrics: Dict[str, float], points_count: int, 
+                                      ratios: List[float] = None) -> Tuple[bool, str]:
     """
     Determine if user should be suggested to manually adjust the formula.
+    Now considers data quality metrics, not just point count.
     
     Args:
         error_metrics: Error metrics from calculate_error_metrics
         points_count: Number of data points used
+        ratios: Optional list of ratios to evaluate data variety
     
     Returns:
         Tuple of (should_suggest, reason)
@@ -633,7 +721,7 @@ def should_suggest_manual_adjustment(error_metrics: Dict[str, float], points_cou
     max_error = error_metrics.get('max_error', 0)
     r_squared = error_metrics.get('r_squared', 0)
     
-    # Conditions for suggesting manual adjustment
+    # Conditions for suggesting manual adjustment based on fit quality
     reasons = []
     
     if avg_error > 1.5:
@@ -644,6 +732,22 @@ def should_suggest_manual_adjustment(error_metrics: Dict[str, float], points_cou
     
     if r_squared < 0.7 and points_count >= 5:
         reasons.append(f"R-squared is low ({r_squared:.2f})")
+    
+    # Check data variety if ratios are provided
+    if ratios and len(ratios) >= 2:
+        quality_metrics = calculate_data_quality_metrics(ratios, [0] * len(ratios))
+        distinct_groups = quality_metrics['distinct_ratio_groups']
+        ratio_spread = quality_metrics['ratio_spread']
+        
+        if distinct_groups == 1:
+            reasons.append(f"all {points_count} points use the same ratio (need different ratios)")
+        elif distinct_groups == 2:
+            reasons.append(f"only 2 distinct ratio groups ({ratio_spread:.3f} spread)")
+        elif distinct_groups < 4 and points_count >= 8:
+            reasons.append(f"only {distinct_groups} distinct ratios across {points_count} points")
+        
+        if ratio_spread < 0.15 and distinct_groups >= 3:
+            reasons.append(f"ratio spread is very small ({ratio_spread:.3f})")
     
     if points_count >= 8 and avg_error > 0.8:
         reasons.append(f"consistent high error over {points_count} points")

@@ -13,7 +13,7 @@ DEFAULT_A_VALUE = 32.0
 MIN_RATIO = 0.3
 MAX_RATIO = 3.0
 MIN_B = 10.0
-MAX_B = 200.0
+MAX_B = 2000.0  # Increased from 200 to 2000
 MIN_A = 1.0
 MAX_A = 300.0
 

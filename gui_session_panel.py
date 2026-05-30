@@ -14,7 +14,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from core_config import get_ratio_limits, get_outlier_settings
 from core_math import (
     DEFAULT_A_VALUE, time_from_ratio, ratio_from_time, clamp_ratio, 
-    get_formula_string, fit_hyperbolic
+    get_formula_string, fit_hyperbolic, MAX_B
 )
 from gui_common_dialogs import ManualLapTimeDialog
 
@@ -257,10 +257,10 @@ class SessionPanel(QWidget):
 
         row2.addWidget(QLabel("b:"))
         self.b_spin = QDoubleSpinBox()
-        self.b_spin.setRange(0.01, 200.0)
+        self.b_spin.setRange(0.01, MAX_B)  # Use MAX_B from core_math
         self.b_spin.setDecimals(3)
         self.b_spin.setValue(self.b)
-        self.b_spin.setFixedWidth(70)
+        self.b_spin.setFixedWidth(80)
         self.b_spin.valueChanged.connect(self.on_b_changed)
         row2.addWidget(self.b_spin)
         row2.addStretch()

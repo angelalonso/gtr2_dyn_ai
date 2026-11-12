@@ -6,9 +6,12 @@ Provides reusable database operations for track/vehicle curve data
 
 import sqlite3
 import traceback
+import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class CurveDatabase:
@@ -92,6 +95,17 @@ class CurveDatabase:
                 UNIQUE(track, vehicle_class, session_type)
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS applied_ratios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                track TEXT NOT NULL,
+                vehicle_class TEXT NOT NULL,
+                session_type TEXT NOT NULL,
+                ratio REAL NOT NULL,
+                applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         cursor.execute("PRAGMA table_info(formulas)")
         columns = [col[1] for col in cursor.fetchall()]
@@ -110,9 +124,45 @@ class CurveDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_formulas_class ON formulas(vehicle_class)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_formulas_track_class ON formulas(track, vehicle_class)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_data_points_track_class ON data_points(track, vehicle_class)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_applied_ratios_combo ON applied_ratios(track, vehicle_class, session_type, applied_at)")
         
         conn.commit()
         conn.close()
+
+    def save_applied_ratio(self, track: str, vehicle_class: str,
+                           session_type: str, ratio: float) -> bool:
+        """Store a ratio applied to an AIW for a track/class/session."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO applied_ratios (track, vehicle_class, session_type, ratio)
+                VALUES (?, ?, ?, ?)
+            """, (track, vehicle_class, session_type, float(ratio)))
+            conn.commit()
+            conn.close()
+            return True
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            logger.error("Error saving applied ratio: %s", exc)
+            return False
+
+    def get_last_applied_ratios(self, track: str, vehicle_class: str) -> Dict[str, float]:
+        """Return the latest applied ratio for each session for a track/class."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT session_type, ratio
+            FROM applied_ratios
+            WHERE track = ? AND vehicle_class = ?
+            AND id IN (
+                SELECT MAX(id)
+                FROM applied_ratios
+                WHERE track = ? AND vehicle_class = ?
+                GROUP BY session_type
+            )
+        """, (track, vehicle_class, track, vehicle_class))
+        ratios = {session_type: ratio for session_type, ratio in cursor.fetchall()}
+        conn.close()
+        return ratios
     
     def database_exists(self) -> bool:
         """Check if database file exists"""

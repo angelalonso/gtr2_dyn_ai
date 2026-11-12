@@ -110,11 +110,21 @@ def update_base_path(new_path: Path, config_file: str = "cfg.yml") -> bool:
 
 
 def get_results_file_path(config_file: str = "cfg.yml") -> Optional[Path]:
-    """Get the full path to raceresults.txt from config"""
+    """Get the legacy default result-file path from config."""
     base_path = get_base_path(config_file)
     if base_path:
         results_path = base_path / 'UserData' / 'Log' / 'Results' / 'raceresults.txt'
         logger.info(f"[CONFIG] Results file path: {results_path}")
+        return results_path
+    return None
+
+
+def get_results_directory_path(config_file: str = "cfg.yml") -> Optional[Path]:
+    """Get the directory containing GTR2 result files."""
+    base_path = get_base_path(config_file)
+    if base_path:
+        results_path = base_path / 'UserData' / 'Log' / 'Results'
+        logger.info(f"[CONFIG] Results directory path: {results_path}")
         return results_path
     return None
 

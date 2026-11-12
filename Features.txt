@@ -1,0 +1,100 @@
+GTR2 Dynamic AI - Feature Inventory and Requested Changes
+
+Current features
+---------------
+
+1. Automatic result monitoring
+   - Polls the configured GTR2 UserData/Log/Results directory.
+   - Selects the regular file changed most recently that parses as race results;
+     the filename is not required to be raceresults.txt.
+   - Uses the configurable poll_interval setting (5 seconds by default).
+   - Remembers the selected file and its modification state to avoid processing
+     unchanged data repeatedly.
+   - Parses race and qualifying results in a background monitoring thread.
+
+2. Result extraction
+   - Reads track and AIW information from the [Race] section.
+   - Resolves AIW files case-insensitively and by track when necessary.
+   - Reads QualRatio and RaceRatio from the AIW [Waypoint] section.
+   - Reads the user's vehicle, qualifying time, and best lap.
+   - Reads AI driver vehicles, qualifying times, best laps, race times, and lap counts.
+   - Calculates best and worst AI times for qualifying and race sessions.
+
+3. Automatic AI tuning
+   - Calculates qualifying and race ratios from user lap times.
+   - Supports separate QualRatio and RaceRatio values.
+   - Applies configured minimum and maximum ratio limits.
+   - Updates AIW files and creates backups before modification.
+   - Can be enabled or disabled with the Auto-calculate Ratios switch.
+   - Supports reverting the previous ratio in each ratio panel.
+
+4. Data collection and persistence
+   - Can save complete race sessions and all AI results to SQLite.
+   - Can automatically harvest data points or disable automatic harvesting.
+   - Stores track, vehicle class, ratio, lap time, and session type data points.
+   - Stores historical user lap times and uses a configurable number of recent
+     values, including median smoothing.
+   - Stores fitted formulas and formula quality information per track, vehicle
+     class, and session type.
+
+5. Vehicle and formula handling
+   - Scans GTR2 vehicle files and maps vehicles to configured vehicle classes.
+   - Uses vehicle classes when calculating and storing tuning formulas.
+   - Fits the hyperbolic relationship LapTime = A / Ratio + B.
+   - Provides formula confidence, point count, and average error indicators.
+   - Supports formula locking and manual formula/data management through the
+     setup and visualizer tools.
+
+6. Main window
+   - Shows the selected track and detected or manually selected car class.
+   - Displays qualifying and race ratios, last ratios read from AIW files,
+     expected AI lap-time ranges, user times, formulas, and data quality.
+   - Supports manual track selection from available AIW files.
+   - Supports manual car-class selection.
+   - Restores the latest applied ratios for a selected track/car-class
+     combination; otherwise it reads the current AIW ratios.
+   - Supports manual ratio editing when automatic ratio calculation is off.
+   - Provides a read-now button with a seconds-until-next-read countdown.
+   - Provides Auto-harvest Data, Auto-calculate Ratios, Setup, Graph, and Exit
+     controls.
+
+7. Supporting tools and safeguards
+   - Setup manager for paths, polling, ratio limits, user-lap settings,
+     outlier settings, vehicle classes, tracks, backups, and logs.
+   - Visualizer for formulas, curves, data points, and user-lap history.
+   - Pre-run checks for installation paths, required files, PLR settings, and
+     vehicle data.
+   - Error logging, validation, AIW backup/restore support, and test suites.
+
+Implemented requested changes
+-----------------
+
+1. Latest result file selection
+   - Implemented: inspect regular files in the configured results folder.
+   - Implemented: choose the most recently modified file that parses as valid
+     race results, regardless of filename.
+   - Implemented: remember file identity, modification time, and size so an
+     unchanged selected file is not processed repeatedly.
+
+2. Main-window read control
+   - Implemented: main-window button shows the countdown until the next read.
+   - Implemented: pressing the button reads the newest result immediately.
+   - Implemented: the countdown resets after automatic and manual reads.
+   - Existing configurable polling remains available.
+
+3. Track and car selection with ratio restoration
+   - Implemented: track and car-class selection are available on the main
+     window.
+   - Implemented: restore the last QualRatio and RaceRatio applied for the
+     selected track/car-class combination.
+   - Implemented: if no saved value exists, display the current AIW ratio.
+   - Implemented: applied ratios are stored in the SQLite database.
+
+Confirmed compatibility decisions
+---------------------------------------
+
+1. Use the newest regular parseable file, ignoring files that cannot be parsed.
+2. Keep the existing vehicle-class model rather than splitting history by exact
+   vehicle.
+3. Use the file in the results folder that was changed last; unchanged
+   file/version state is not processed repeatedly.

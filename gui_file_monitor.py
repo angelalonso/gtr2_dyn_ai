@@ -7,9 +7,8 @@ Checks for changes every N seconds and processes race data
 import threading
 import logging
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 
-from core_config import get_results_file_path, get_poll_interval, get_config_with_defaults
 from core_data_extraction import DataExtractor, RaceData
 
 logger = logging.getLogger(__name__)
@@ -36,29 +35,30 @@ class SimplifiedLogger:
 
 
 class FileMonitorDaemon:
-    """Daemon that monitors a file for changes - works with both PyQt and tkinter"""
+    """Daemon that monitors the newest parseable result file in a directory."""
     
-    def __init__(self, file_path: Path, base_path: Path, poll_interval: float = 5.0, callback: Optional[Callable] = None):
-        self.file_path = file_path
+    def __init__(self, results_path: Path, base_path: Path, poll_interval: float = 5.0, callback: Optional[Callable] = None):
+        self.results_path = Path(results_path)
+        self.results_dir = self.results_path if self.results_path.suffix == "" else self.results_path.parent
         self.base_path = base_path
         self.poll_interval = poll_interval
         self.running = False
-        self.last_mtime = None
-        self.last_size = None
+        self.last_file_state: Optional[Tuple[str, int, int]] = None
         self.timer = None
         self.callback = callback
         self.extractor = DataExtractor(base_path)
-        logger.info(f"[MONITOR] Initialized: watching {file_path}")
+        self._read_lock = threading.Lock()
+        logger.info(f"[MONITOR] Initialized: watching {self.results_dir}")
         
     def start(self):
-        if not self.file_path.exists():
-            logger.warning(f"[MONITOR] File does not exist yet: {self.file_path}")
-            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.results_dir.exists():
+            logger.warning(f"[MONITOR] Results directory does not exist yet: {self.results_dir}")
+            self.results_dir.mkdir(parents=True, exist_ok=True)
         
         self._update_file_state()
         self.running = True
         self._schedule_check()
-        logger.info(f"[MONITOR] Started monitoring: {self.file_path}")
+        logger.info(f"[MONITOR] Started monitoring: {self.results_dir}")
         
     def stop(self):
         self.running = False
@@ -73,60 +73,64 @@ class FileMonitorDaemon:
             self.timer.start()
     
     def _update_file_state(self):
-        try:
-            if self.file_path.exists():
-                stat = self.file_path.stat()
-                self.last_mtime = stat.st_mtime
-                self.last_size = stat.st_size
-                logger.debug(f"[MONITOR] Initial state: mtime={self.last_mtime}, size={self.last_size}")
-        except Exception:
-            pass
+        latest = self._find_latest_parseable_file()
+        if latest:
+            self.last_file_state = self._file_state(latest)
+            logger.debug(f"[MONITOR] Initial state: {self.last_file_state}")
+
+    def _file_state(self, path: Path) -> Tuple[str, int, int]:
+        stat = path.stat()
+        return str(path), stat.st_mtime_ns, stat.st_size
+
+    def _find_latest_parseable_file(self) -> Optional[Path]:
+        if not self.results_dir.exists():
+            return None
+        candidates = []
+        for path in self.results_dir.iterdir():
+            try:
+                if path.is_file():
+                    candidates.append((path, path.stat().st_mtime_ns))
+            except OSError as exc:
+                logger.warning(f"[MONITOR] Cannot inspect {path}: {exc}")
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        for path, _ in candidates:
+            try:
+                race_data = self.extractor.parse_race_results(path)
+                if race_data and race_data.has_data():
+                    return path
+            except OSError as exc:
+                logger.warning(f"[MONITOR] Cannot inspect {path}: {exc}")
+        return None
+
+    def read_now(self):
+        """Read the latest result file immediately, without waiting for the timer."""
+        threading.Thread(target=self._read_latest, args=(True,), daemon=True).start()
+
+    def _read_latest(self, force: bool = False):
+        with self._read_lock:
+            latest = self._find_latest_parseable_file()
+            if not latest:
+                logger.debug("[MONITOR] No parseable result files found")
+                return
+            try:
+                state = self._file_state(latest)
+            except OSError as exc:
+                logger.warning(f"[MONITOR] Cannot inspect latest result file: {exc}")
+                return
+            if not force and state == self.last_file_state:
+                return
+            logger.info(f"[MONITOR] Reading latest result file: {latest}")
+            race_data = self.extractor.parse_race_results(latest)
+            if race_data and race_data.has_data() and self.callback:
+                self.callback(race_data)
+            self.last_file_state = state
     
     def _check_file(self):
         try:
             if not self.running:
                 return
-            
-            if not self.file_path.exists():
-                logger.debug(f"[MONITOR] File not found: {self.file_path}")
-                self._schedule_check()
-                return
-            
-            try:
-                stat = self.file_path.stat()
-                current_mtime = stat.st_mtime
-                current_size = stat.st_size
-            except OSError as e:
-                logger.error(f"[MONITOR] OSError reading file stats: {e}")
-                self._schedule_check()
-                return
-            
-            changed = (
-                self.last_mtime is None
-                or current_mtime != self.last_mtime
-                or current_size != self.last_size
-            )
-            
-            if changed:
-                logger.info(f"[MONITOR] FILE CHANGE DETECTED! mtime: {self.last_mtime} -> {current_mtime}, size: {self.last_size} -> {current_size}")
-                
-                race_data = self.extractor.parse_race_results(self.file_path)
-                if race_data and race_data.has_data():
-                    logger.info(f"[MONITOR] Race data parsed successfully: track={race_data.track_name}")
-                    if self.callback:
-                        logger.info(f"[MONITOR] Calling callback with race data")
-                        self.callback(race_data)
-                else:
-                    logger.warning(f"[MONITOR] No valid race data extracted from file")
-                
-                self.last_mtime = current_mtime
-                self.last_size = current_size
-            else:
-                logger.debug(f"[MONITOR] No change detected")
-            
+            self._read_latest()
         except Exception as e:
             logger.error(f"[MONITOR] Error checking file: {e}")
-            import traceback
-            traceback.print_exc()
         finally:
             self._schedule_check()

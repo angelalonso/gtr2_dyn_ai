@@ -10,6 +10,7 @@ import logging
 import sqlite3
 import subprocess
 import re
+import math
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -23,7 +24,7 @@ from core_database import CurveDatabase
 from core_math import DEFAULT_A_VALUE, ratio_from_time, clamp_ratio, calculate_b_from_point, get_formula_string
 from core_aiw_utils import update_aiw_ratio
 from core_config import (
-    get_config_with_defaults, get_results_file_path, get_poll_interval,
+    get_config_with_defaults, get_results_directory_path, get_poll_interval,
     get_db_path, create_default_config_if_missing, get_base_path,
     get_ratio_limits, update_base_path, get_nr_last_user_laptimes
 )
@@ -68,6 +69,10 @@ class MainWindowTk:
         self.current_track = ""
         self.current_vehicle = ""
         self.current_vehicle_class = ""
+        self.vehicle_class_manually_selected = False
+        self.poll_interval = get_poll_interval(config_file)
+        self.next_read_seconds = math.ceil(self.poll_interval)
+        self._countdown_after_id = None
         
         self.qual_best_ai = None
         self.qual_worst_ai = None
@@ -259,6 +264,13 @@ class MainWindowTk:
         self.car_class_label = tk.Label(class_container, text="- No Car Selected -", bg='#2b2b2b',
                                          fg='#FFA500', font=('Arial', 14, 'bold'))
         self.car_class_label.pack(side=tk.LEFT, padx=5, pady=5)
+
+        select_class_btn = tk.Button(class_container, text="Select Car Class",
+                                     bg='#2196F3', fg='white',
+                                     font=('Arial', 10, 'bold'), relief=tk.FLAT,
+                                     padx=12, pady=4,
+                                     command=self.manual_vehicle_class_selection)
+        select_class_btn.pack(side=tk.LEFT, padx=(10, 0), pady=5)
         
         # Panels container
         panels_frame = tk.Frame(main_frame, bg='#1e1e1e')
@@ -298,6 +310,13 @@ class MainWindowTk:
                                         relief=tk.FLAT, padx=18, pady=8,
                                         command=self.toggle_autoratio)
         self.autoratio_btn.pack(side=tk.LEFT, padx=5)
+
+        self.read_btn = tk.Button(
+            bottom_frame, text="Read Results Now", bg='#607D8B', fg='white',
+            font=('Arial', 10, 'bold'), relief=tk.FLAT, padx=12, pady=8,
+            command=self.read_results_now
+        )
+        self.read_btn.pack(side=tk.LEFT, padx=5)
         
         # Spacer
         tk.Frame(bottom_frame, bg='#1e1e1e', width=50).pack(side=tk.LEFT, expand=True)
@@ -335,6 +354,7 @@ class MainWindowTk:
         style.configure("TProgressbar", background='#4CAF50', troughcolor='#3c3c3c')
         
         logger.info("UI setup complete")
+        self._update_read_countdown()
     
     def manual_track_selection(self):
         """Open dialog for manual track selection"""
@@ -379,9 +399,66 @@ class MainWindowTk:
             # Update formulas from autopilot
             self.update_formulas_from_autopilot()
             self.update_display()
-            self.load_aiw_ratios()
+            self.load_selected_combo_ratios()
             
             self._update_status_safe(f"Track selected: {selected_track}")
+
+    def manual_vehicle_class_selection(self):
+        """Select a vehicle class for viewing and ratio history."""
+        choices = sorted(set(self.class_mapping.keys()) | set(self.db.get_all_vehicle_classes()))
+        if not choices:
+            messagebox.showwarning("No Car Classes", "No vehicle classes are available yet.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Select Car Class")
+        dialog.geometry("400x350")
+        dialog.configure(bg='#2b2b2b')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        tk.Label(dialog, text="Select Car Class", bg='#2b2b2b', fg='#FFA500',
+                 font=('Arial', 16, 'bold')).pack(pady=15)
+        listbox = tk.Listbox(dialog, bg='#1e1e1e', fg='#4CAF50',
+                             font=('Courier', 11))
+        listbox.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        for choice in choices:
+            listbox.insert(tk.END, choice)
+
+        def select(event=None):
+            selection = listbox.curselection()
+            if not selection:
+                return
+            self.current_vehicle_class = choices[selection[0]]
+            self.vehicle_class_manually_selected = True
+            self.car_class_label.config(text=self.current_vehicle_class)
+            self.load_selected_combo_ratios()
+            self.update_formulas_from_autopilot()
+            self.update_display()
+            self._update_status_safe(f"Car class selected: {self.current_vehicle_class}")
+            dialog.destroy()
+
+        listbox.bind('<Double-Button-1>', select)
+        tk.Button(dialog, text="Select", command=select, bg='#2196F3', fg='white',
+                  relief=tk.FLAT, padx=15, pady=5).pack(pady=(0, 15))
+
+    def _update_read_countdown(self):
+        if not hasattr(self, 'read_btn'):
+            return
+        self.read_btn.config(text=f"Read Results Now ({max(0, self.next_read_seconds)}s)")
+        if self.next_read_seconds > 0:
+            self.next_read_seconds -= 1
+        else:
+            self.next_read_seconds = math.ceil(self.poll_interval)
+        self._countdown_after_id = self.root.after(1000, self._update_read_countdown)
+
+    def _reset_read_countdown(self):
+        self.next_read_seconds = math.ceil(self.poll_interval)
+
+    def read_results_now(self):
+        """Request an immediate read of the newest result file."""
+        if self.daemon:
+            self._reset_read_countdown()
+            self.daemon.read_now()
     
     def get_ai_times_for_track(self, track: str, session_type: str) -> Tuple[Optional[float], Optional[float]]:
         """Get best and worst AI times for a track"""
@@ -496,6 +573,22 @@ class MainWindowTk:
         
         self.qual_read_ratio = qual_ratio
         self.race_read_ratio = race_ratio
+
+    def load_selected_combo_ratios(self):
+        """Restore saved ratios for the selected track/class, or read the AIW."""
+        if not self.current_track:
+            return
+        self.load_aiw_ratios()
+        if self.current_vehicle_class:
+            saved = self.db.get_last_applied_ratios(
+                self.current_track, self.current_vehicle_class
+            )
+            if "qual" in saved:
+                self._update_qual_ratio(saved["qual"])
+                self._update_qual_read_ratio(saved["qual"])
+            if "race" in saved:
+                self._update_race_ratio(saved["race"])
+                self._update_race_read_ratio(saved["race"])
     
     def find_aiw_file(self, track_name: str) -> Optional[Path]:
         """Find AIW file for a track using the shared utility"""
@@ -673,6 +766,11 @@ class MainWindowTk:
                 self.race_panel.update_ratio(clamped_ratio)
                 self.race_panel.update_last_read_ratio(clamped_ratio)
                 self.race_read_ratio = clamped_ratio
+            if self.current_vehicle_class:
+                self.db.save_applied_ratio(
+                    self.current_track, self.current_vehicle_class,
+                    session_type, clamped_ratio
+                )
             
             if ratio_adjusted:
                 self._update_status_safe(f"{ratio_name} adjusted to {clamped_ratio:.6f} (within limits)")
@@ -700,6 +798,10 @@ class MainWindowTk:
                 return
             
             if update_aiw_ratio(aiw_path, "QualRatio", old_ratio, self.backup_dir):
+                if self.current_vehicle_class:
+                    self.db.save_applied_ratio(
+                        self.current_track, self.current_vehicle_class, "qual", old_ratio
+                    )
                 self.last_qual_ratio = old_ratio
                 self.qual_panel.update_ratio(old_ratio)
                 self.qual_panel.update_last_read_ratio(old_ratio)
@@ -724,6 +826,10 @@ class MainWindowTk:
                 return
             
             if update_aiw_ratio(aiw_path, "RaceRatio", old_ratio, self.backup_dir):
+                if self.current_vehicle_class:
+                    self.db.save_applied_ratio(
+                        self.current_track, self.current_vehicle_class, "race", old_ratio
+                    )
                 self.last_race_ratio = old_ratio
                 self.race_panel.update_ratio(old_ratio)
                 self.race_panel.update_last_read_ratio(old_ratio)
@@ -735,14 +841,13 @@ class MainWindowTk:
                 messagebox.showerror("Revert Failed", "Failed to update the AIW file.")
     
     def start_daemon(self):
-        file_path = get_results_file_path(self.config_file)
+        results_dir = get_results_directory_path(self.config_file)
         base_path = get_base_path(self.config_file)
-        if not file_path or not base_path:
-            logger.warning(f"[MAIN] Cannot start daemon: file_path={file_path}, base_path={base_path}")
+        if not results_dir or not base_path:
+            logger.warning(f"[MAIN] Cannot start daemon: results_dir={results_dir}, base_path={base_path}")
             return
-        poll_interval = get_poll_interval(self.config_file)
-        logger.info(f"[MAIN] Starting daemon with callback, watching: {file_path}")
-        self.daemon = FileMonitorDaemon(file_path, base_path, poll_interval, callback=self.on_file_changed)
+        logger.info(f"[MAIN] Starting daemon with callback, watching: {results_dir}")
+        self.daemon = FileMonitorDaemon(results_dir, base_path, self.poll_interval, callback=self.on_file_changed)
         self.daemon.start()
     
     def stop_daemon(self):
@@ -753,6 +858,7 @@ class MainWindowTk:
     def on_file_changed(self, race_data: RaceData):
         """Direct callback from the file monitor daemon - called from background thread"""
         logger.info(f"[MAIN] on_file_changed called with race_data: track={race_data.track_name if race_data else 'None'}")
+        self.root.after(0, self._reset_read_countdown)
         
         if not race_data:
             logger.warning("[MAIN] No race data received")
@@ -776,7 +882,8 @@ class MainWindowTk:
         vehicle_class_for_autopilot = ""
         if user_vehicle:
             vehicle_class_for_autopilot = get_vehicle_class(user_vehicle, self.class_mapping)
-            self.root.after(0, lambda: self._update_user_vehicle_class(user_vehicle, vehicle_class_for_autopilot))
+            if not self.vehicle_class_manually_selected:
+                self.root.after(0, lambda: self._update_user_vehicle_class(user_vehicle, vehicle_class_for_autopilot))
         
         current_track_ref = self.current_track
         current_vehicle_class_ref = self.current_vehicle_class
@@ -875,6 +982,8 @@ class MainWindowTk:
                         ratio_adjusted = (clamped != new_qual_ratio_val)
                         
                         if update_aiw_ratio(aiw_path, "QualRatio", clamped, self.backup_dir):
+                            if vehicle_class_for_autopilot:
+                                self.db.save_applied_ratio(track_name, vehicle_class_for_autopilot, "qual", clamped)
                             self.root.after(0, lambda: self._update_qual_ratio(clamped))
                             self.root.after(0, lambda: self._enable_qual_revert())
                             
@@ -901,6 +1010,8 @@ class MainWindowTk:
                         ratio_adjusted = (clamped != new_race_ratio_val)
                         
                         if update_aiw_ratio(aiw_path, "RaceRatio", clamped, self.backup_dir):
+                            if vehicle_class_for_autopilot:
+                                self.db.save_applied_ratio(track_name, vehicle_class_for_autopilot, "race", clamped)
                             self.root.after(0, lambda: self._update_race_ratio(clamped))
                             self.root.after(0, lambda: self._enable_race_revert())
                             
@@ -1178,6 +1289,8 @@ class MainWindowTk:
 
     def on_close(self):
         self.stop_daemon()
+        if self._countdown_after_id:
+            self.root.after_cancel(self._countdown_after_id)
         if self.advanced_window:
             try:
                 self.advanced_window.close()

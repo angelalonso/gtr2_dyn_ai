@@ -7,7 +7,6 @@ Lightweight main screen that uses tkinter and calls PyQt5 for advanced dialogs
 import sys
 import threading
 import logging
-import sqlite3
 import subprocess
 import re
 import math
@@ -21,12 +20,13 @@ from gui_pre_run_check import launch_setup_manager
 from gui_track_selector import TrackSelectorDialog
 from gui_ratio_panel import RatioPanel
 from core_database import CurveDatabase
+from core_database import connect_database
 from core_math import DEFAULT_A_VALUE, ratio_from_time, clamp_ratio, calculate_b_from_point, get_formula_string
 from core_aiw_utils import update_aiw_ratio
 from core_config import (
     get_config_with_defaults, get_results_directory_path, get_poll_interval,
     get_db_path, create_default_config_if_missing, get_base_path,
-    get_ratio_limits, update_base_path, get_nr_last_user_laptimes
+    get_ratio_limits, update_base_path, get_nr_last_user_laptimes, save_config
 )
 from core_data_extraction import RaceData
 from core_autopilot import AutopilotManager, get_vehicle_class, load_vehicle_classes
@@ -53,6 +53,12 @@ class MainWindowTk:
         
         self.autosave_enabled = True
         self.autoratio_enabled = True
+        self.ai_target_settings = {
+            "mode": "quartile_band" if self.config.get("ai_target_enabled", False) else "disabled",
+            "band": self.config.get("ai_target_band", "top_25"),
+            "min_ai_laps": self.config.get("ai_target_min_laps", 8),
+            "min_ai_races": self.config.get("ai_target_min_races", 2),
+        }
         
         self.qual_panel = None
         self.race_panel = None
@@ -311,6 +317,19 @@ class MainWindowTk:
                                         command=self.toggle_autoratio)
         self.autoratio_btn.pack(side=tk.LEFT, padx=5)
 
+        self.ai_target_btn = tk.Button(
+            bottom_frame,
+            bg='#3F51B5',
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            relief=tk.FLAT,
+            padx=12,
+            pady=8,
+            command=self.configure_ai_target,
+        )
+        self.ai_target_btn.pack(side=tk.LEFT, padx=5)
+        self._update_ai_target_button()
+
         self.read_btn = tk.Button(
             bottom_frame, text="Read Results Now", bg='#607D8B', fg='white',
             font=('Arial', 10, 'bold'), relief=tk.FLAT, padx=12, pady=8,
@@ -323,7 +342,7 @@ class MainWindowTk:
         
         # Exit button
         exit_btn = tk.Button(bottom_frame, text="Exit", bg='#d20a0a', fg='white',
-                              font=('Arial', 11, 'bold'), relief=tk.FLAT, padx=24, pady=8,
+                              font=('Arial', 11, 'bold'), relief=tk.FLAT, padx=12, pady=8,
                               command=self.on_close)
         exit_btn.pack(side=tk.RIGHT, padx=5)
 
@@ -335,9 +354,9 @@ class MainWindowTk:
         self.setup_btn.pack(side=tk.RIGHT, padx=5)
 
         # Graph Button
-        self.graph_btn = tk.Button(bottom_frame, text="Graph", bg='#FF9800', fg='white',
+        self.graph_btn = tk.Button(bottom_frame, text="Graphs", bg='#FF9800', fg='white',
                                     font=('Arial', 10, 'bold'),
-                                    relief=tk.FLAT, padx=12, pady=8,
+                                    relief=tk.FLAT, width=12, padx=12, pady=8,
                                     command=self.on_graph_open)
         self.graph_btn.pack(side=tk.RIGHT, padx=5)
         
@@ -462,7 +481,7 @@ class MainWindowTk:
     
     def get_ai_times_for_track(self, track: str, session_type: str) -> Tuple[Optional[float], Optional[float]]:
         """Get best and worst AI times for a track"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         if session_type == "qual":
@@ -686,6 +705,69 @@ class MainWindowTk:
             self.autopilot_manager.reload_formulas()
             self.update_formulas_from_autopilot()
             self.update_display()
+
+    def _update_ai_target_button(self):
+        labels = {
+            "top_25": "Top 25%",
+            "second_25": "25-50%",
+            "third_25": "50-75%",
+            "bottom_25": "Slowest 25%",
+        }
+        if self.ai_target_settings.get("mode") == "quartile_band":
+            text = f"Target: {labels.get(self.ai_target_settings.get('band'), 'Top 25%')}"
+        else:
+            text = "Target: Current"
+        self.ai_target_btn.config(text=text)
+
+    def configure_ai_target(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("AI Target Band")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = tk.Frame(dialog, bg='#1e1e1e', padx=20, pady=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(
+            frame,
+            text="Target the center of the selected AI pace band.\n"
+                 "Quartile mode activates after enough historical AI data exists.",
+            bg='#1e1e1e', fg='white', justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 10))
+        enabled = tk.BooleanVar(value=self.ai_target_settings.get("mode") == "quartile_band")
+        tk.Checkbutton(
+            frame, text="Enable quartile targeting", variable=enabled,
+            bg='#1e1e1e', fg='white', selectcolor='#3c3c3c',
+            activebackground='#1e1e1e',
+        ).pack(anchor=tk.W)
+        band = tk.StringVar(value=self.ai_target_settings.get("band", "top_25"))
+        options = [
+            ("top_25", "Top 25% (fastest)"),
+            ("second_25", "25% - 50%"),
+            ("third_25", "50% - 75%"),
+            ("bottom_25", "Slowest 25%"),
+        ]
+        for value, label in options:
+            tk.Radiobutton(
+                frame, text=label, variable=band, value=value,
+                bg='#1e1e1e', fg='white', selectcolor='#3c3c3c',
+                activebackground='#1e1e1e',
+            ).pack(anchor=tk.W)
+
+        def save_target():
+            self.ai_target_settings["mode"] = "quartile_band" if enabled.get() else "disabled"
+            self.ai_target_settings["band"] = band.get()
+            self.config["ai_target_enabled"] = enabled.get()
+            self.config["ai_target_band"] = band.get()
+            save_config(self.config, self.config_file)
+            self._update_ai_target_button()
+            self._update_status_safe(
+                f"AI target set to {band.get() if enabled.get() else 'current behavior'}"
+            )
+            dialog.destroy()
+
+        tk.Button(
+            frame, text="Apply", command=save_target,
+            bg='#4CAF50', fg='white', relief=tk.FLAT, padx=15, pady=5,
+        ).pack(anchor=tk.E, pady=(12, 0))
     
     def on_manual_edit(self, session_type: str, new_ratio: float, aiw_path: Path = None):
         """
@@ -922,9 +1004,13 @@ class MainWindowTk:
         # Save race session to database (database operations are thread-safe)
         race_dict = race_data.to_dict()
         race_id = self.db.save_race_session(race_dict)
+        if not race_id:
+            logger.info("[MAIN] Result was already processed or could not be persisted; skipping tuning")
+            self._update_status_safe("Result already processed or could not be saved")
+            return
         
         # Save data points if autosave is enabled
-        if race_id and self.autosave_enabled:
+        if self.autosave_enabled:
             points_added = 0
             for t_name, vehicle_name, ratio_val, lap_time, s_type in race_data.to_data_points_with_vehicles():
                 try:
@@ -945,6 +1031,8 @@ class MainWindowTk:
         
         self.root.after(0, lambda: self._reload_and_update())
         
+        target_fallback_messages = []
+
         # Auto-ratio update if enabled
         if self.autoratio_enabled and aiw_path:
             logger.info("[MAIN] Auto-ratio is enabled, calculating new ratios")
@@ -975,8 +1063,19 @@ class MainWindowTk:
                         track_name, vehicle_class_for_autopilot, "qual"
                     )
                     effective_time = median_time if median_time is not None else user_qualifying_sec
+                    target_time, target_info = self.autopilot_manager.get_target_time_for_combo(
+                        track_name, vehicle_class_for_autopilot, "qual",
+                        effective_time, self.ai_target_settings
+                    )
+                    if not target_info.get("active") and self.ai_target_settings.get("mode") == "quartile_band":
+                        target_fallback_messages.append(
+                            f"Qualifying needs {target_info.get('needed_laps', 0)} more AI laps "
+                            f"and {target_info.get('needed_races', 0)} more race(s)"
+                        )
                     
-                    new_qual_ratio_val = ratio_from_time(effective_time, DEFAULT_A_VALUE, self.qual_b)
+                    new_qual_ratio_val = self.autopilot_manager.calculate_ratio(
+                        track_name, vehicle_class_for_autopilot, "qual", target_time
+                    )
                     if new_qual_ratio_val and (last_qual is None or abs(new_qual_ratio_val - last_qual) > 0.000001):
                         clamped = clamp_ratio(new_qual_ratio_val, self.min_ratio, self.max_ratio)
                         ratio_adjusted = (clamped != new_qual_ratio_val)
@@ -1003,8 +1102,19 @@ class MainWindowTk:
                         track_name, vehicle_class_for_autopilot, "race"
                     )
                     effective_time = median_time if median_time is not None else user_best_lap_sec
+                    target_time, target_info = self.autopilot_manager.get_target_time_for_combo(
+                        track_name, vehicle_class_for_autopilot, "race",
+                        effective_time, self.ai_target_settings
+                    )
+                    if not target_info.get("active") and self.ai_target_settings.get("mode") == "quartile_band":
+                        target_fallback_messages.append(
+                            f"Race needs {target_info.get('needed_laps', 0)} more AI laps "
+                            f"and {target_info.get('needed_races', 0)} more race(s)"
+                        )
                     
-                    new_race_ratio_val = ratio_from_time(effective_time, DEFAULT_A_VALUE, self.race_b)
+                    new_race_ratio_val = self.autopilot_manager.calculate_ratio(
+                        track_name, vehicle_class_for_autopilot, "race", target_time
+                    )
                     if new_race_ratio_val and (last_race is None or abs(new_race_ratio_val - last_race) > 0.000001):
                         clamped = clamp_ratio(new_race_ratio_val, self.min_ratio, self.max_ratio)
                         ratio_adjusted = (clamped != new_race_ratio_val)
@@ -1025,7 +1135,12 @@ class MainWindowTk:
         
         qual_display = f"{self.last_qual_ratio:.6f}" if self.last_qual_ratio is not None else "N/A"
         race_display = f"{self.last_race_ratio:.6f}" if self.last_race_ratio is not None else "N/A"
-        self._update_status_safe(f"Data processed: {track_name} - Qual: {qual_display} / Race: {race_display}")
+        status = f"Data processed: {track_name} - Qual: {qual_display} / Race: {race_display}"
+        if target_fallback_messages:
+            status += " | AI target bands unavailable; using default behavior (" + "; ".join(
+                target_fallback_messages
+            ) + ")"
+        self._update_status_safe(status)
     
     # Helper methods for thread-safe UI updates
     def _update_track(self, track_name):
@@ -1222,7 +1337,7 @@ class MainWindowTk:
         if hasattr(self, 'setup_btn'):
             self.setup_btn.config(state=tk.NORMAL, text="Setup")
         if hasattr(self, 'graph_btn'):
-            self.graph_btn.config(state=tk.NORMAL, text="Graph")
+            self.graph_btn.config(state=tk.NORMAL, text="Graphs")
         self.root.update_idletasks()
     
     def on_setup_open(self):

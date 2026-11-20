@@ -8,6 +8,7 @@ import re
 import os
 import traceback
 import logging
+import hashlib
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
@@ -49,6 +50,7 @@ class RaceData:
     ai_count: int = 0
     ai_results: List[Dict] = field(default_factory=list)
     raw_content: str = ""
+    source_fingerprint: Optional[str] = None
     canonical_track_id: Optional[str] = None
     
     def __post_init__(self):
@@ -58,7 +60,27 @@ class RaceData:
             self.race_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     
     def has_data(self) -> bool:
-        return bool(self.track_name or self.aiw_file or self.qual_ratio or self.race_ratio)
+        return not self.validation_errors()
+
+    def validation_errors(self) -> List[str]:
+        """Return reasons this result is not safe to process automatically."""
+        errors = []
+        if not self.track_name:
+            errors.append("missing track")
+        if not self.aiw_path or not self.aiw_path.exists():
+            errors.append("missing AIW file")
+        if not self.user_vehicle:
+            errors.append("missing user vehicle")
+        if self.user_qualifying_sec <= 0 and self.user_best_lap_sec <= 0:
+            errors.append("missing user lap time")
+        if not self.ai_results:
+            errors.append("missing AI results")
+        if not any(
+            (ai.get("qual_time_sec") or 0) > 0 or (ai.get("best_lap_sec") or 0) > 0
+            for ai in self.ai_results
+        ):
+            errors.append("missing AI lap times")
+        return errors
     
     def to_dict(self) -> Dict:
         return {
@@ -76,6 +98,7 @@ class RaceData:
             'user_qualifying': self.user_qualifying,
             'user_qualifying_sec': self.user_qualifying_sec,
             'ai_results': self.ai_results,
+            'source_fingerprint': self.source_fingerprint,
         }
     
     def to_data_points_with_vehicles(self) -> List[Tuple[str, str, float, float, str]]:
@@ -164,6 +187,10 @@ class DataExtractor:
             
             data = RaceData()
             data.raw_content = content
+            data.source_fingerprint = hashlib.sha256(
+                content.replace("\r\n", "\n").encode("utf-8")
+            ).hexdigest()
+            data.race_id = f"result-{data.source_fingerprint[:32]}"
             
             self._parse_header(content, data)
             logger.info(f"[EXTRACTOR] Header parsed: track_name={data.track_name}, aiw_file={data.aiw_file}")

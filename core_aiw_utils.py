@@ -7,10 +7,55 @@ Provides consistent AIW file finding across all modules
 import re
 import shutil
 import logging
+import os
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_AIW_LOCKS = {}
+_AIW_LOCKS_GUARD = threading.Lock()
+
+
+def _aiw_lock(path: Path):
+    key = str(path.resolve())
+    with _AIW_LOCKS_GUARD:
+        return _AIW_LOCKS.setdefault(key, threading.RLock())
+
+
+def _atomic_write(path: Path, content: str, attempts: int = 3) -> None:
+    payload = content.encode("utf-8")
+    last_error = None
+    for attempt in range(attempts):
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+            ) as temp:
+                temp.write(payload)
+                temp.flush()
+                os.fsync(temp.fileno())
+                temp_path = Path(temp.name)
+            os.replace(temp_path, path)
+            try:
+                dir_fd = os.open(path.parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (AttributeError, OSError):
+                pass
+            return
+        except OSError as exc:
+            last_error = exc
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+            if attempt + 1 < attempts:
+                time.sleep(0.25 * (attempt + 1))
+    raise last_error
 
 
 def find_aiw_file_from_path(relative_path: str, base_path: Path) -> Optional[Path]:
@@ -78,12 +123,17 @@ def find_aiw_file_from_path(relative_path: str, base_path: Path) -> Optional[Pat
                         logger.debug(f"Found AIW via case-insensitive filename: {file_path}")
                         return file_path
                 
-                # Second, look for any AIW file in this directory
-                for ext in ['.AIW', '.aiw']:
-                    for file_path in current_path.iterdir():
-                        if file_path.is_file() and file_path.suffix.lower() == ext:
-                            logger.debug(f"Found AIW via any AIW file in folder: {file_path}")
-                            return file_path
+                # Do not silently choose between multiple layouts.
+                aiw_files = [
+                    file_path for file_path in current_path.iterdir()
+                    if file_path.is_file() and file_path.suffix.lower() == ".aiw"
+                ]
+                if len(aiw_files) == 1:
+                    logger.debug(f"Found AIW via any AIW file in folder: {aiw_files[0]}")
+                    return aiw_files[0]
+                if len(aiw_files) > 1:
+                    logger.error("Ambiguous AIW path %s; multiple layouts found", relative_path)
+                    return None
         else:
             next_path = None
             if current_path.exists() and current_path.is_dir():
@@ -100,11 +150,16 @@ def find_aiw_file_from_path(relative_path: str, base_path: Path) -> Optional[Pat
     
     if current_path and current_path.exists() and current_path.is_dir():
         # Look for any AIW file in the final directory
-        for ext in ['.AIW', '.aiw']:
-            for file_path in current_path.iterdir():
-                if file_path.is_file() and file_path.suffix.lower() == ext:
-                    logger.debug(f"Found AIW via any AIW file (fallback): {file_path}")
-                    return file_path
+        aiw_files = [
+            file_path for file_path in current_path.iterdir()
+            if file_path.is_file() and file_path.suffix.lower() == ".aiw"
+        ]
+        if len(aiw_files) == 1:
+            logger.debug(f"Found AIW via any AIW file (fallback): {aiw_files[0]}")
+            return aiw_files[0]
+        if len(aiw_files) > 1:
+            logger.error("Ambiguous AIW fallback for %s", relative_path)
+            return None
     
     # Last resort: search by track folder name
     if track_folder:
@@ -164,6 +219,10 @@ def update_aiw_ratio(aiw_path: Path, ratio_name: str, new_ratio: float, backup_d
         if not aiw_path.exists():
             logger.error(f"update_aiw_ratio: AIW file not found: {aiw_path}")
             return False
+
+        if aiw_path.stat().st_mode & 0o222 == 0:
+            logger.error(f"update_aiw_ratio: AIW file is read-only: {aiw_path}")
+            return False
         
         logger.info(f"update_aiw_ratio: updating {ratio_name} to {new_ratio:.6f} in {aiw_path}")
         
@@ -177,24 +236,30 @@ def update_aiw_ratio(aiw_path: Path, ratio_name: str, new_ratio: float, backup_d
             else:
                 logger.debug(f"Original backup exists: {backup_path}")
         
-        raw = aiw_path.read_bytes()
-        content = raw.replace(b"\x00", b"").decode("utf-8", errors="ignore")
-        
-        pattern = rf'({re.escape(ratio_name)}\s*=\s*\(?)\s*[0-9.eE+-]+\s*(\)?)'
-        new_content, count = re.subn(
-            pattern,
-            lambda m: f"{m.group(1)}{new_ratio:.6f}{m.group(2)}",
-            content,
-            flags=re.IGNORECASE
-        )
-        
-        if count > 0:
-            aiw_path.write_bytes(new_content.encode("utf-8", errors="ignore"))
+        with _aiw_lock(aiw_path):
+            raw = aiw_path.read_bytes()
+            content = raw.replace(b"\x00", b"").decode("utf-8", errors="ignore")
+            pattern = rf'({re.escape(ratio_name)}\s*=\s*\(?)\s*[0-9.eE+-]+\s*(\)?)'
+            new_content, count = re.subn(
+                pattern,
+                lambda m: f"{m.group(1)}{new_ratio:.6f}{m.group(2)}",
+                content,
+                flags=re.IGNORECASE
+            )
+            if count == 0:
+                logger.warning(f"Could not find {ratio_name} pattern in {aiw_path.name}")
+                return False
+            _atomic_write(aiw_path, new_content)
+            verify = aiw_path.read_bytes().replace(b"\x00", b"").decode("utf-8", errors="ignore")
+            if not re.search(
+                rf'{re.escape(ratio_name)}\s*=\s*\(?\s*{re.escape(f"{new_ratio:.6f}")}',
+                verify,
+                re.IGNORECASE,
+            ):
+                logger.error("AIW verification failed after updating %s", ratio_name)
+                return False
             logger.info(f"Updated {ratio_name} to {new_ratio:.6f} in {aiw_path.name}")
             return True
-        else:
-            logger.warning(f"Could not find {ratio_name} pattern in {aiw_path.name}")
-            return False
             
     except Exception as e:
         logger.error(f"Error updating AIW ratio: {e}")
@@ -268,7 +333,8 @@ def ensure_aiw_has_ratios(aiw_path: Path, backup_dir: Optional[Path] = None) -> 
         if lines_to_insert:
             insert_text = "\n" + "\n".join(lines_to_insert)
             new_content = content[:insert_pos] + insert_text + content[insert_pos:]
-            aiw_path.write_bytes(new_content.encode("utf-8", errors="ignore"))
+            with _aiw_lock(aiw_path):
+                _atomic_write(aiw_path, new_content)
             logger.info(f"Added missing ratios to {aiw_path.name}: {lines_to_insert}")
         
         return True

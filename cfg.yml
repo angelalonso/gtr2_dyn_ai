@@ -1,3 +1,7 @@
+ai_target_band: top_25
+ai_target_enabled: false
+ai_target_min_laps: 8
+ai_target_min_races: 2
 base_path: test_mocks
 db_path: ai_data.db
 max_ratio: 1.5

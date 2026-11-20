@@ -7,11 +7,37 @@ Provides reusable database operations for track/vehicle curve data
 import sqlite3
 import traceback
 import logging
+import threading
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+_DB_LOCKS = {}
+_DB_LOCKS_GUARD = threading.Lock()
+_WAL_DATABASES = set()
+
+
+def get_database_lock(db_path: str):
+    key = str(Path(db_path).resolve())
+    with _DB_LOCKS_GUARD:
+        return _DB_LOCKS.setdefault(key, threading.RLock())
+
+
+def connect_database(db_path: str) -> sqlite3.Connection:
+    """Open SQLite with a busy timeout, WAL, and foreign-key enforcement."""
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    key = str(Path(db_path).resolve())
+    with _DB_LOCKS_GUARD:
+        wal_enabled = key in _WAL_DATABASES
+    if not wal_enabled:
+        conn.execute("PRAGMA journal_mode = WAL")
+        with _DB_LOCKS_GUARD:
+            _WAL_DATABASES.add(key)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 class CurveDatabase:
@@ -23,7 +49,7 @@ class CurveDatabase:
     
     def _init_database(self):
         """Initialize database schema if it doesn't exist"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -53,6 +79,7 @@ class CurveDatabase:
                 user_best_lap_sec REAL,
                 user_qualifying TEXT,
                 user_qualifying_sec REAL,
+                source_fingerprint TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -111,6 +138,13 @@ class CurveDatabase:
         columns = [col[1] for col in cursor.fetchall()]
         if 'a_value' not in columns:
             cursor.execute("ALTER TABLE formulas ADD COLUMN a_value REAL DEFAULT 32.0")
+        race_columns = [col[1] for col in cursor.execute("PRAGMA table_info(race_sessions)")]
+        if 'source_fingerprint' not in race_columns:
+            cursor.execute("ALTER TABLE race_sessions ADD COLUMN source_fingerprint TEXT")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_race_fingerprint "
+            "ON race_sessions(source_fingerprint)"
+        )
         
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_track ON data_points(track)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_vehicle_class ON data_points(vehicle_class)")
@@ -133,7 +167,7 @@ class CurveDatabase:
                            session_type: str, ratio: float) -> bool:
         """Store a ratio applied to an AIW for a track/class/session."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_database(self.db_path)
             conn.execute("""
                 INSERT INTO applied_ratios (track, vehicle_class, session_type, ratio)
                 VALUES (?, ?, ?, ?)
@@ -147,7 +181,7 @@ class CurveDatabase:
 
     def get_last_applied_ratios(self, track: str, vehicle_class: str) -> Dict[str, float]:
         """Return the latest applied ratio for each session for a track/class."""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT session_type, ratio
@@ -170,7 +204,7 @@ class CurveDatabase:
     
     def get_all_tracks(self) -> List[str]:
         """Get all unique track names"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT track FROM data_points ORDER BY track")
         tracks = [row[0] for row in cursor.fetchall()]
@@ -179,7 +213,7 @@ class CurveDatabase:
     
     def get_all_vehicle_classes(self) -> List[str]:
         """Get all unique vehicle class names"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT vehicle_class FROM data_points ORDER BY vehicle_class")
         vehicles = [row[0] for row in cursor.fetchall()]
@@ -198,7 +232,7 @@ class CurveDatabase:
         if not tracks or not vehicle_classes:
             return []
         
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         track_placeholders = ','.join(['?' for _ in tracks])
@@ -237,7 +271,7 @@ class CurveDatabase:
     
     def get_stats(self) -> Dict[str, any]:
         """Get database statistics"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("SELECT COUNT(*) FROM data_points")
@@ -275,8 +309,10 @@ class CurveDatabase:
     
     def save_race_session(self, race_data: dict) -> Optional[str]:
         """Save a complete race session with ALL AI results"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
+        lock = get_database_lock(self.db_path)
+        lock.acquire()
         
         try:
             timestamp = race_data.get('timestamp')
@@ -286,13 +322,24 @@ class CurveDatabase:
             race_id = race_data.get('race_id')
             if not race_id:
                 race_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+            fingerprint = race_data.get('source_fingerprint')
+            if fingerprint:
+                cursor.execute(
+                    "SELECT race_id FROM race_sessions WHERE source_fingerprint = ?",
+                    (fingerprint,),
+                )
+                if cursor.fetchone():
+                    logger.info("Skipping duplicate race result: %s", fingerprint)
+                    return None
             
             cursor.execute("""
-                INSERT OR REPLACE INTO race_sessions (
+                INSERT INTO race_sessions (
                     race_id, timestamp, track_name, track_folder, aiw_file,
                     qual_ratio, race_ratio, user_name, user_vehicle,
-                    user_best_lap, user_best_lap_sec, user_qualifying, user_qualifying_sec
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_best_lap, user_best_lap_sec, user_qualifying, user_qualifying_sec,
+                    source_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 race_id,
                 timestamp,
@@ -306,7 +353,8 @@ class CurveDatabase:
                 race_data.get('user_best_lap'),
                 race_data.get('user_best_lap_sec', 0.0),
                 race_data.get('user_qualifying'),
-                race_data.get('user_qualifying_sec', 0.0)
+                race_data.get('user_qualifying_sec', 0.0),
+                fingerprint
             ))
             
             for ai in race_data.get('ai_results', []):
@@ -335,11 +383,12 @@ class CurveDatabase:
             return race_id
             
         except Exception as e:
-            print(f"Error saving race session: {e}")
+            logger.error("Error saving race session: %s", e)
             conn.rollback()
             return None
         finally:
             conn.close()
+            lock.release()
     
     def add_data_point(
         self, 
@@ -351,13 +400,14 @@ class CurveDatabase:
     ) -> bool:
         """Add a new data point to the database"""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = connect_database(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO data_points (track, vehicle_class, ratio, lap_time, session_type)
-                VALUES (?, ?, ?, ?, ?)
-            """, (track, vehicle_class, float(ratio), float(lap_time), session_type))
-            conn.commit()
+            with get_database_lock(self.db_path):
+                cursor.execute("""
+                    INSERT INTO data_points (track, vehicle_class, ratio, lap_time, session_type)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (track, vehicle_class, float(ratio), float(lap_time), session_type))
+                conn.commit()
             conn.close()
             return True
         except Exception as e:
@@ -369,27 +419,28 @@ class CurveDatabase:
         if not points:
             return 0
         
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         added = 0
-        for track, vehicle_class, ratio, lap_time, session_type in points:
-            try:
-                cursor.execute("""
-                    INSERT INTO data_points (track, vehicle_class, ratio, lap_time, session_type)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (track, vehicle_class, ratio, lap_time, session_type))
-                added += 1
-            except Exception as e:
-                print(f"Error adding point: {e}")
+        with get_database_lock(self.db_path):
+            for track, vehicle_class, ratio, lap_time, session_type in points:
+                try:
+                    cursor.execute("""
+                        INSERT INTO data_points (track, vehicle_class, ratio, lap_time, session_type)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (track, vehicle_class, ratio, lap_time, session_type))
+                    added += 1
+                except Exception as e:
+                    logger.error("Error adding point: %s", e)
         
-        conn.commit()
+            conn.commit()
         conn.close()
         return added
     
     def get_race_sessions(self, track_name: str = None, limit: int = 50) -> List[Dict]:
         """Get race sessions, optionally filtered by track"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -408,7 +459,7 @@ class CurveDatabase:
     
     def get_ai_results_for_race(self, race_id: str) -> List[Dict]:
         """Get ALL AI results for a specific race"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -419,7 +470,7 @@ class CurveDatabase:
     
     def get_all_ai_times_for_track(self, track_name: str, session_type: str = "race") -> List[Tuple[float, float]]:
         """Get all AI times for a specific track"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         if session_type == "qual":
@@ -443,10 +494,28 @@ class CurveDatabase:
         results = [(row[0], row[1]) for row in cursor.fetchall() if row[0] is not None and row[1] > 0]
         conn.close()
         return results
+
+    def get_ai_target_sample_counts(
+        self, track_name: str, session_type: str
+    ) -> Tuple[int, int]:
+        """Return valid AI lap count and race count for target-band readiness."""
+        conn = connect_database(self.db_path)
+        if session_type == "qual":
+            time_column = "ar.qual_time_sec"
+        else:
+            time_column = "ar.best_lap_sec"
+        row = conn.execute(f"""
+            SELECT COUNT({time_column}), COUNT(DISTINCT rs.race_id)
+            FROM race_sessions rs
+            JOIN ai_results ar ON rs.race_id = ar.race_id
+            WHERE rs.track_name = ? AND {time_column} IS NOT NULL AND {time_column} > 0
+        """, (track_name,)).fetchone()
+        conn.close()
+        return int(row[0] or 0), int(row[1] or 0)
     
     def get_formula(self, track: str, vehicle_class: str, session_type: str) -> Optional[Tuple[float, float]]:
         """Get formula parameters for a track, vehicle class, and session type"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""

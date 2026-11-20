@@ -7,7 +7,7 @@ Checks for changes every N seconds and processes race data
 import threading
 import logging
 from pathlib import Path
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable, Tuple, Dict
 
 from core_data_extraction import DataExtractor, RaceData
 
@@ -48,6 +48,7 @@ class FileMonitorDaemon:
         self.callback = callback
         self.extractor = DataExtractor(base_path)
         self._read_lock = threading.Lock()
+        self._parse_cache: Dict[Tuple[str, int, int], bool] = {}
         logger.info(f"[MONITOR] Initialized: watching {self.results_dir}")
         
     def start(self):
@@ -95,8 +96,15 @@ class FileMonitorDaemon:
         candidates.sort(key=lambda item: item[1], reverse=True)
         for path, _ in candidates:
             try:
+                state = self._file_state(path)
+                if state in self._parse_cache:
+                    if self._parse_cache[state]:
+                        return path
+                    continue
                 race_data = self.extractor.parse_race_results(path)
-                if race_data and race_data.has_data():
+                parseable = bool(race_data and race_data.has_data())
+                self._parse_cache[state] = parseable
+                if parseable:
                     return path
             except OSError as exc:
                 logger.warning(f"[MONITOR] Cannot inspect {path}: {exc}")

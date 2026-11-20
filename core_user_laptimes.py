@@ -8,6 +8,7 @@ with automatic trimming based on nr_last_user_laptimes
 import sqlite3
 import logging
 from pathlib import Path
+from core_database import connect_database
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime
 from statistics import median
@@ -29,7 +30,7 @@ class UserLapTimesManager:
     
     def _init_database(self):
         """Initialize the user_laptimes table"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -80,7 +81,7 @@ class UserLapTimesManager:
         if timestamp is None:
             timestamp = datetime.now().isoformat()
         
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         try:
@@ -144,7 +145,7 @@ class UserLapTimesManager:
         Returns:
             List of (lap_time, ratio, timestamp) tuples, sorted by timestamp ascending
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -181,7 +182,7 @@ class UserLapTimesManager:
         Returns:
             List of dictionaries with laptime data
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -210,7 +211,7 @@ class UserLapTimesManager:
     
     def delete_laptime(self, laptime_id: int) -> bool:
         """Delete a specific user laptime entry by ID"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         try:
@@ -225,7 +226,7 @@ class UserLapTimesManager:
     
     def clear_combo(self, track: str, vehicle_class: str, session_type: str) -> int:
         """Clear all laptimes for a specific combo"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         try:
@@ -243,7 +244,7 @@ class UserLapTimesManager:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about stored user laptimes"""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_database(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute("SELECT COUNT(*) FROM user_laptimes")

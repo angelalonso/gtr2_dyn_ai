@@ -29,6 +29,10 @@ DEFAULT_CONFIG = {
     'outlier_method': 'std',
     'outlier_threshold': 2.0,
     'outlier_min_points': 3,
+    'ai_target_enabled': False,
+    'ai_target_band': 'top_25',
+    'ai_target_min_laps': 8,
+    'ai_target_min_races': 2,
 }
 
 

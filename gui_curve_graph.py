@@ -1026,6 +1026,7 @@ class CurveGraphWidget(QWidget):
                     f"Point ID: {point_id} | Session: {session_type}{invalid_text} | "
                     f"Ratio: {ratio:.6f} | Lap Time: {minutes}:{seconds:06.3f}"
                 )
+            self.point_selected.emit(self.current_track, session_type, ratio, lap_time)
     
     def set_formulas(self, qual_a: float, qual_b: float, race_a: float, race_b: float):
         self.qual_a = qual_a

@@ -168,16 +168,26 @@ def find_aiw_file_for_track(track_name: str, base_path: Path) -> Optional[Path]:
     for track_dir in locations_dir.iterdir():
         if track_dir.is_dir() and track_dir.name.lower() == folder_name.lower():
             # Look for AIW file that matches the stem
-            for ext in [".AIW", ".aiw"]:
-                aiw_file = track_dir / f"{aiw_stem}{ext}"
-                if aiw_file.exists():
+            expected_name = f"{aiw_stem}.aiw"
+            for aiw_file in track_dir.iterdir():
+                if aiw_file.is_file() and aiw_file.name.lower() == expected_name.lower():
                     logger.info(f"find_aiw_file_for_track: found exact match: {aiw_file}")
                     return aiw_file
                 
-                # Also look for any AIW file in this folder if stem doesn't match
-                for aiw_file in track_dir.glob(f"*{ext}"):
-                    logger.info(f"find_aiw_file_for_track: found AIW in folder: {aiw_file}")
-                    return aiw_file
+            # Do not silently choose between multiple layouts.
+            candidates = [
+                file_path for file_path in track_dir.iterdir()
+                if file_path.is_file() and file_path.suffix.lower() == ".aiw"
+            ]
+            if len(candidates) == 1:
+                logger.info(f"find_aiw_file_for_track: found AIW in folder: {candidates[0]}")
+                return candidates[0]
+            if len(candidates) > 1:
+                logger.error(
+                    "Multiple AIW layouts found for %s; specify the canonical layout",
+                    track_name,
+                )
+                return None
     
     # Second, look for folder where AIW stem exactly matches track name
     for track_dir in locations_dir.iterdir():
@@ -193,9 +203,12 @@ def find_aiw_file_for_track(track_name: str, base_path: Path) -> Optional[Path]:
         if track_dir.is_dir() and (folder_name.lower() in track_dir.name.lower() or track_dir.name.lower() in folder_name.lower()):
             for ext in [".AIW", ".aiw"]:
                 aiw_files = list(track_dir.glob(f"*{ext}"))
-                if aiw_files:
+                if len(aiw_files) == 1:
                     logger.info(f"find_aiw_file_for_track: found by partial folder match: {aiw_files[0]}")
                     return aiw_files[0]
+                if len(aiw_files) > 1:
+                    logger.error("Partial track match is ambiguous for %s", track_name)
+                    return None
     
     # Fourth, try recursive search in all Locations subdirectories
     for ext in [".AIW", ".aiw"]:

@@ -9,6 +9,7 @@ import re
 import sqlite3
 import json
 import shutil
+import math
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any, Set
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from core_math import (
     get_formula_string, calculate_error_metrics, should_suggest_manual_adjustment,
     calculate_data_quality_metrics
 )
-from core_database import CurveDatabase
+from core_database import CurveDatabase, connect_database, get_database_lock
 from core_data_extraction import RaceData
 from core_config import get_base_path, get_nr_last_user_laptimes, get_ratio_limits
 from core_aiw_utils import find_aiw_file_from_path, find_aiw_file_by_track, update_aiw_ratio, ensure_aiw_has_ratios
@@ -83,22 +84,35 @@ def load_vehicle_classes(classes_path=None):
 def get_vehicle_class(vehicle_name: str, class_mapping: Dict[str, Dict]) -> str:
     if not vehicle_name:
         return "Unknown"
-    
-    vehicle_lower = vehicle_name.lower().strip()
-    
+
+    def normalize(value: str) -> str:
+        return " ".join(
+            "".join(char.lower() if char.isalnum() else " " for char in value).split()
+        )
+
+    vehicle_normalized = normalize(vehicle_name)
+    exact_matches = []
     for class_name, class_data in class_mapping.items():
-        vehicles = class_data.get("vehicles", [])
-        for v in vehicles:
-            if v.lower() == vehicle_lower:
-                return class_name
-    
+        for vehicle in class_data.get("vehicles", []):
+            if normalize(vehicle) == vehicle_normalized:
+                exact_matches.append(class_name)
+    if len(set(exact_matches)) == 1:
+        return exact_matches[0]
+    if len(set(exact_matches)) > 1:
+        logger.warning("Ambiguous exact vehicle classification for %r: %s", vehicle_name, exact_matches)
+        return "Unknown"
+
+    partial_matches = []
     for class_name, class_data in class_mapping.items():
-        vehicles = class_data.get("vehicles", [])
-        for v in vehicles:
-            if v.lower() in vehicle_lower or vehicle_lower in v.lower():
-                return class_name
-    
-    return vehicle_name
+        for vehicle in class_data.get("vehicles", []):
+            candidate = normalize(vehicle)
+            if candidate and (candidate in vehicle_normalized or vehicle_normalized in candidate):
+                partial_matches.append(class_name)
+    if len(set(partial_matches)) == 1:
+        return partial_matches[0]
+    if partial_matches:
+        logger.warning("Ambiguous vehicle classification for %r: %s", vehicle_name, partial_matches)
+    return "Unknown"
 
 
 @dataclass
@@ -243,7 +257,7 @@ class FormulaManager:
         self._load_formulas()
     
     def _init_database(self):
-        conn = sqlite3.connect(self.db.db_path)
+        conn = connect_database(self.db.db_path)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -270,6 +284,19 @@ class FormulaManager:
                 ratio_spread REAL DEFAULT 0.0
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS formula_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                track TEXT NOT NULL,
+                vehicle_class TEXT NOT NULL,
+                session_type TEXT NOT NULL,
+                a REAL NOT NULL,
+                b REAL NOT NULL,
+                confidence REAL DEFAULT 0.0,
+                data_points_used INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         cursor.execute("PRAGMA table_info(formulas)")
         columns = [col[1] for col in cursor.fetchall()]
@@ -293,7 +320,7 @@ class FormulaManager:
     
     def _load_formulas(self):
         self._formulas.clear()
-        conn = sqlite3.connect(self.db.db_path)
+        conn = connect_database(self.db.db_path)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT track, vehicle_class, a, b, session_type, confidence, 
@@ -374,11 +401,28 @@ class FormulaManager:
             logger.warning(f"Not saving invalid formula: {formula.get_formula_string()}")
             return False
         
-        conn = sqlite3.connect(self.db.db_path)
+        conn = connect_database(self.db.db_path)
         cursor = conn.cursor()
         
         vehicles_str = ','.join(formula.vehicles_in_class)
         
+        with get_database_lock(self.db.db_path):
+            cursor.execute("""
+                SELECT a, b, confidence, data_points_used
+                FROM formulas
+                WHERE track = ? AND vehicle_class = ? AND session_type = ?
+            """, (formula.track, formula.vehicle_class, formula.session_type))
+            previous = cursor.fetchone()
+            if previous:
+                cursor.execute("""
+                    INSERT INTO formula_history
+                    (track, vehicle_class, session_type, a, b, confidence, data_points_used)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    formula.track, formula.vehicle_class, formula.session_type,
+                    previous[0], previous[1], previous[2], previous[3],
+                ))
+
         cursor.execute("""
             INSERT OR REPLACE INTO formulas 
             (track, vehicle_class, a, b, session_type, confidence, data_points_used, 
@@ -404,6 +448,21 @@ class FormulaManager:
         
         logger.debug(f"Saved formula for {formula.track}/{formula.vehicle_class}/{formula.session_type}: {formula.get_formula_string()} (locked={formula.is_locked})")
         return True
+
+    def get_formula_history(
+        self, track: str, vehicle_class: str, session_type: str, limit: int = 20
+    ) -> List[Tuple[float, float, str]]:
+        """Return prior formula values, newest first."""
+        conn = connect_database(self.db.db_path)
+        rows = conn.execute("""
+            SELECT a, b, created_at
+            FROM formula_history
+            WHERE track = ? AND vehicle_class = ? AND session_type = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (track, vehicle_class, session_type, limit)).fetchall()
+        conn.close()
+        return [(row[0], row[1], row[2]) for row in rows]
     
     def lock_formula(self, track: str, vehicle_class: str, session_type: str, reason: str = "") -> bool:
         """Lock a formula so it won't be auto-updated"""
@@ -508,7 +567,7 @@ class FormulaManager:
         
         if existing and existing.data_points_used >= 1:
             # Get all points from database for this combo
-            conn = sqlite3.connect(self.db.db_path)
+            conn = connect_database(self.db.db_path)
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT ratio, lap_time FROM data_points 
@@ -559,7 +618,7 @@ class FormulaManager:
             return False, ""
         
         # Get all data points for this combo
-        conn = sqlite3.connect(self.db.db_path)
+        conn = connect_database(self.db.db_path)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT ratio, lap_time FROM data_points 
@@ -585,7 +644,7 @@ class FormulaManager:
             return "Insufficient data for quality assessment"
         
         # Get all data points for this combo
-        conn = sqlite3.connect(self.db.db_path)
+        conn = connect_database(self.db.db_path)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT ratio, lap_time FROM data_points 
@@ -639,7 +698,7 @@ class AutopilotEngine:
             return False
     
     def _get_data_points(self, track: str, vehicle_class: str, session_type: str) -> List[Tuple[float, float]]:
-        conn = sqlite3.connect(self.db.db_path)
+        conn = connect_database(self.db.db_path)
         cursor = conn.cursor()
         session_filter = "qual" if session_type == "qual" else "race"
         cursor.execute("""
@@ -651,14 +710,38 @@ class AutopilotEngine:
         conn.close()
         return [(ratio, lap_time) for ratio, lap_time in rows]
     
-    def calculate_target_time_from_settings(self, best_ai_time, worst_ai_time, settings):
+    def calculate_target_time_from_settings(
+        self, best_ai_time, worst_ai_time, settings, ai_times=None, race_count=0
+    ):
         if best_ai_time <= 0 or worst_ai_time <= 0:
             return best_ai_time if best_ai_time > 0 else worst_ai_time
         
         ai_range = worst_ai_time - best_ai_time
         mode = settings.get("mode", "percentage")
-        
-        if mode == "percentage":
+        min_laps = int(settings.get("min_ai_laps", 8))
+        min_races = int(settings.get("min_ai_races", 2))
+        min_drivers = max(1, math.ceil(min_laps / max(1, min_races)))
+        ai_times = sorted(t for t in (ai_times or []) if t > 0)
+
+        if mode == "quartile_band":
+            band = settings.get("band", "top_25")
+            centers = {
+                "top_25": 0.125,
+                "second_25": 0.375,
+                "third_25": 0.625,
+                "bottom_25": 0.875,
+            }
+            if len(ai_times) >= min_laps and race_count >= min_races:
+                position = centers.get(band, 0.125)
+                index = position * (len(ai_times) - 1)
+                lower = int(index)
+                upper = min(lower + 1, len(ai_times) - 1)
+                fraction = index - lower
+                target = ai_times[lower] + (ai_times[upper] - ai_times[lower]) * fraction
+            else:
+                # Preserve the old behavior until the distribution is meaningful.
+                target = best_ai_time + (ai_range * 0.5)
+        elif mode == "percentage":
             pct = settings.get("percentage", 50) / 100.0
             target = best_ai_time + (ai_range * pct)
         elif mode == "faster_than_best":
@@ -672,6 +755,46 @@ class AutopilotEngine:
         target = target + error_margin
         target = max(best_ai_time, min(worst_ai_time + error_margin, target))
         return target
+
+    def get_target_time_for_combo(
+        self, track: str, vehicle_class: str, session_type: str,
+        fallback_time: float, settings: Optional[Dict] = None
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Return the configured target time and readiness information."""
+        settings = settings or {}
+        if settings.get("mode") != "quartile_band":
+            return fallback_time, {"active": False, "reason": "quartile mode disabled"}
+
+        points = self.db.get_all_ai_times_for_track(track, session_type)
+        ai_times = [time for _, time in points if time > 0]
+        valid_laps, race_count = self.db.get_ai_target_sample_counts(track, session_type)
+        min_laps = int(settings.get("min_ai_laps", 8))
+        min_races = int(settings.get("min_ai_races", 2))
+        min_drivers = max(1, math.ceil(min_laps / max(1, min_races)))
+        ready = valid_laps >= min_laps and race_count >= min_races
+        if not ai_times:
+            return fallback_time, {
+                "active": False, "reason": "no AI times",
+                "valid_laps": valid_laps, "races": race_count,
+                "needed_laps": max(0, min_laps - valid_laps),
+                "needed_races": max(0, min_races - race_count),
+                "min_drivers_per_race": min_drivers,
+            }
+
+        best, worst = min(ai_times), max(ai_times)
+        target = self.calculate_target_time_from_settings(
+            best, worst, settings, ai_times, race_count
+        )
+        return (target if ready else fallback_time), {
+            "active": ready,
+            "reason": "ready" if ready else "insufficient AI data",
+            "band": settings.get("band", "top_25"),
+            "valid_laps": valid_laps,
+            "races": race_count,
+            "needed_laps": max(0, min_laps - valid_laps),
+            "needed_races": max(0, min_races - race_count),
+            "min_drivers_per_race": min_drivers,
+        }
     
     def _get_median_user_laptime(self, track: str, vehicle_class: str, session_type: str) -> Optional[float]:
         if self.user_laptimes_manager:
@@ -1027,6 +1150,11 @@ class AutopilotManager:
     
     def calculate_ratio(self, track: str, vehicle_class: str, session_type: str, lap_time: float) -> Optional[float]:
         return self.engine.calculate_ratio_from_formula(track, vehicle_class, session_type, lap_time)
+
+    def get_target_time_for_combo(self, track, vehicle_class, session_type, fallback_time, settings=None):
+        return self.engine.get_target_time_for_combo(
+            track, vehicle_class, session_type, fallback_time, settings
+        )
     
     def get_user_laptimes_for_combo(self, track: str, vehicle_class: str, 
                                      session_type: str) -> List[Tuple[float, float]]:

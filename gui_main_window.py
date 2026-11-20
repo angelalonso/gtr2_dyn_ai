@@ -270,6 +270,9 @@ class MainWindowTk:
         self.car_class_label = tk.Label(class_container, text="- No Car Selected -", bg='#2b2b2b',
                                          fg='#FFA500', font=('Arial', 14, 'bold'))
         self.car_class_label.pack(side=tk.LEFT, padx=5, pady=5)
+        self.data_quality_label = tk.Label(class_container, text="Data: -", bg='#2b2b2b',
+                                           fg='#888', font=('Arial', 10))
+        self.data_quality_label.pack(side=tk.LEFT, padx=(12, 5), pady=5)
 
         select_class_btn = tk.Button(class_container, text="Select Car Class",
                                      bg='#2196F3', fg='white',
@@ -398,6 +401,8 @@ class MainWindowTk:
             logger.info(f"Manually selected track: {selected_track}")
             self.current_track = selected_track
             self.track_label.config(text=selected_track)
+            self._update_data_quality_display()
+            self._update_ai_target_button()
             self.root.title(f"GTR2 Dynamic AI - {selected_track}")
             
             # Verify AIW file exists and store its path
@@ -441,7 +446,8 @@ class MainWindowTk:
                              font=('Courier', 11))
         listbox.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         for choice in choices:
-            listbox.insert(tk.END, choice)
+            quality = self.db.get_data_quality(self.current_track, choice) if self.current_track else {}
+            listbox.insert(tk.END, f"{choice}  [Data {quality.get('score', 0.0):.1f}/10]")
 
         def select(event=None):
             selection = listbox.curselection()
@@ -450,6 +456,8 @@ class MainWindowTk:
             self.current_vehicle_class = choices[selection[0]]
             self.vehicle_class_manually_selected = True
             self.car_class_label.config(text=self.current_vehicle_class)
+            self._update_data_quality_display()
+            self._update_ai_target_button()
             self.load_selected_combo_ratios()
             self.update_formulas_from_autopilot()
             self.update_display()
@@ -713,31 +721,62 @@ class MainWindowTk:
             "third_25": "50-75%",
             "bottom_25": "Slowest 25%",
         }
-        if self.ai_target_settings.get("mode") == "quartile_band":
-            text = f"Target: {labels.get(self.ai_target_settings.get('band'), 'Top 25%')}"
+        band = self.ai_target_settings.get("band", "top_25")
+        colors = {
+            "top_25": ("#4CAF50", "white"),
+            "second_25": ("#CDDC39", "black"),
+            "third_25": ("#FBC02D", "black"),
+            "bottom_25": ("#FF9800", "white"),
+        }
+        ready = self._get_ai_target_readiness()
+        if ready["ready"]:
+            text = f"Target: {labels.get(band, 'Top 25%')}"
+            bg, fg = colors.get(band, ("#4CAF50", "white"))
+        elif self.ai_target_settings.get("mode") == "quartile_band":
+            text = "Target: unavailable"
+            bg, fg = "#777777", "white"
         else:
             text = "Target: Current"
-        self.ai_target_btn.config(text=text)
+            bg, fg = "#777777", "white"
+        self.ai_target_btn.config(text=text, bg=bg, fg=fg)
+
+    def _get_ai_target_readiness(self):
+        if not self.current_track or not self.current_vehicle_class:
+            return {"ready": False, "needed_laps": 1, "needed_races": 1}
+        settings = dict(self.ai_target_settings)
+        settings["mode"] = "quartile_band"
+        results = [
+            self.autopilot_manager.get_target_time_for_combo(
+                self.current_track, self.current_vehicle_class, session_type,
+                0.0, settings,
+            )[1]
+            for session_type in ("qual", "race")
+        ]
+        return {
+            "ready": any(result.get("active", False) for result in results),
+            "needed_laps": max(result.get("needed_laps", 0) for result in results),
+            "needed_races": max(result.get("needed_races", 0) for result in results),
+        }
 
     def configure_ai_target(self):
+        readiness = self._get_ai_target_readiness()
+        if not readiness["ready"]:
+            messagebox.showinfo(
+                "AI target bands unavailable",
+                "More AI data is needed before quartile bands can be selected.\n\n"
+                f"Needed: {readiness['needed_laps']} more valid AI laps and "
+                f"{readiness['needed_races']} more race session(s).",
+            )
+            return
+
         dialog = tk.Toplevel(self.root)
         dialog.title("AI Target Band")
         dialog.transient(self.root)
         dialog.grab_set()
         frame = tk.Frame(dialog, bg='#1e1e1e', padx=20, pady=15)
         frame.pack(fill=tk.BOTH, expand=True)
-        tk.Label(
-            frame,
-            text="Target the center of the selected AI pace band.\n"
-                 "Quartile mode activates after enough historical AI data exists.",
-            bg='#1e1e1e', fg='white', justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(0, 10))
-        enabled = tk.BooleanVar(value=self.ai_target_settings.get("mode") == "quartile_band")
-        tk.Checkbutton(
-            frame, text="Enable quartile targeting", variable=enabled,
-            bg='#1e1e1e', fg='white', selectcolor='#3c3c3c',
-            activebackground='#1e1e1e',
-        ).pack(anchor=tk.W)
+        tk.Label(frame, text="Choose the AI pace band to target:",
+                 bg='#1e1e1e', fg='white').pack(anchor=tk.W, pady=(0, 10))
         band = tk.StringVar(value=self.ai_target_settings.get("band", "top_25"))
         options = [
             ("top_25", "Top 25% (fastest)"),
@@ -745,22 +784,34 @@ class MainWindowTk:
             ("third_25", "50% - 75%"),
             ("bottom_25", "Slowest 25%"),
         ]
+        colors = {"top_25": "#4CAF50", "second_25": "#CDDC39",
+                  "third_25": "#FBC02D", "bottom_25": "#FF9800"}
+        band_buttons = {}
+
+        def select_band(selected):
+            band.set(selected)
+            for value, button in band_buttons.items():
+                button.config(relief=tk.SUNKEN if value == selected else tk.RAISED)
+
         for value, label in options:
-            tk.Radiobutton(
-                frame, text=label, variable=band, value=value,
-                bg='#1e1e1e', fg='white', selectcolor='#3c3c3c',
-                activebackground='#1e1e1e',
-            ).pack(anchor=tk.W)
+            button = tk.Button(
+                frame, text=label, command=lambda selected=value: select_band(selected),
+                bg=colors[value], fg="white" if value in ("top_25", "bottom_25") else "black",
+                relief=tk.FLAT, anchor=tk.W, padx=10, pady=6,
+            )
+            button.pack(fill=tk.X, pady=2)
+            band_buttons[value] = button
+        select_band(band.get())
 
         def save_target():
-            self.ai_target_settings["mode"] = "quartile_band" if enabled.get() else "disabled"
+            self.ai_target_settings["mode"] = "quartile_band"
             self.ai_target_settings["band"] = band.get()
-            self.config["ai_target_enabled"] = enabled.get()
+            self.config["ai_target_enabled"] = True
             self.config["ai_target_band"] = band.get()
             save_config(self.config, self.config_file)
             self._update_ai_target_button()
             self._update_status_safe(
-                f"AI target set to {band.get() if enabled.get() else 'current behavior'}"
+                f"AI target set to {band.get()}"
             )
             dialog.destroy()
 
@@ -1015,7 +1066,10 @@ class MainWindowTk:
             for t_name, vehicle_name, ratio_val, lap_time, s_type in race_data.to_data_points_with_vehicles():
                 try:
                     vehicle_class = get_vehicle_class(vehicle_name, self.class_mapping)
-                    if self.db.add_data_point(t_name, vehicle_class, float(ratio_val), float(lap_time), s_type):
+                    if self.db.add_data_point(
+                        t_name, vehicle_class, float(ratio_val), float(lap_time), s_type,
+                        vehicle_name=vehicle_name,
+                    ):
                         points_added += 1
                 except (ValueError, TypeError) as e:
                     logger.error(f"[MAIN] Failed to add data point: {e}")
@@ -1147,6 +1201,20 @@ class MainWindowTk:
         self.current_track = track_name
         self.track_label.config(text=track_name)
         self.root.title(f"GTR2 Dynamic AI - {track_name}")
+        self._update_data_quality_display()
+        self._update_ai_target_button()
+
+    def _update_data_quality_display(self):
+        if not hasattr(self, "data_quality_label"):
+            return
+        if not self.current_track or not self.current_vehicle_class:
+            self.data_quality_label.config(text="Data: -")
+            return
+        quality = self.db.get_data_quality(self.current_track, self.current_vehicle_class)
+        self.data_quality_label.config(
+            text=f"Data: {quality['score']:.1f}/10 "
+                 f"({quality['total_points']} pts, {quality['distinct_ratios']} ratios)"
+        )
     
     def _update_user_qualifying(self, time_sec):
         self.user_qualifying_sec = time_sec
@@ -1191,6 +1259,8 @@ class MainWindowTk:
         self.current_vehicle = vehicle_name
         self.current_vehicle_class = vehicle_class
         self.car_class_label.config(text=vehicle_class if vehicle_class else "Unknown")
+        self._update_data_quality_display()
+        self._update_ai_target_button()
         logger.info(f"[MAIN] Updated vehicle class: {vehicle_name} -> {vehicle_class}")
     
     def _set_qual_previous_ratio(self, ratio):
@@ -1381,11 +1451,16 @@ class MainWindowTk:
                     visualizer_path = Path(__file__).parent / "dyn_ai_visualizer.py"
                 
                 if visualizer_path.exists():
+                    launch_args = []
+                    if self.current_track:
+                        launch_args.extend(["--track", self.current_track])
+                    if self.current_vehicle_class:
+                        launch_args.extend(["--vehicle-class", self.current_vehicle_class])
                     if getattr(sys, 'frozen', False):
-                        subprocess.Popen([str(visualizer_path)], shell=False)
+                        subprocess.Popen([str(visualizer_path), *launch_args], shell=False)
                     else:
                         python_exe = sys.executable
-                        subprocess.Popen([python_exe, str(visualizer_path)], shell=False)
+                        subprocess.Popen([python_exe, str(visualizer_path), *launch_args], shell=False)
                 else:
                     self._show_warning_safe("Visualizer Not Found", 
                         f"Visualizer not found at:\n{visualizer_path}")

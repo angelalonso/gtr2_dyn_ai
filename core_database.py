@@ -57,6 +57,7 @@ class CurveDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 track TEXT NOT NULL,
                 vehicle_class TEXT NOT NULL,
+                vehicle_name TEXT,
                 ratio REAL NOT NULL,
                 lap_time REAL NOT NULL,
                 session_type TEXT NOT NULL,
@@ -141,6 +142,9 @@ class CurveDatabase:
         race_columns = [col[1] for col in cursor.execute("PRAGMA table_info(race_sessions)")]
         if 'source_fingerprint' not in race_columns:
             cursor.execute("ALTER TABLE race_sessions ADD COLUMN source_fingerprint TEXT")
+        data_point_columns = [col[1] for col in cursor.execute("PRAGMA table_info(data_points)")]
+        if 'vehicle_name' not in data_point_columns:
+            cursor.execute("ALTER TABLE data_points ADD COLUMN vehicle_name TEXT")
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_race_fingerprint "
             "ON race_sessions(source_fingerprint)"
@@ -268,6 +272,32 @@ class CurveDatabase:
         conn.close()
         
         return points
+
+    def get_data_quality(self, track: str, vehicle_class: str) -> Dict[str, float]:
+        """Return a 0-10 usability score for a car/track class combination.
+
+        Distinct ratio coverage is weighted more heavily than raw volume. Extra
+        samples at an already-covered ratio contribute only 25% of a new ratio.
+        """
+        conn = connect_database(self.db_path)
+        row = conn.execute("""
+            SELECT COUNT(*), COUNT(DISTINCT ROUND(ratio, 3))
+            FROM data_points
+            WHERE track = ? AND vehicle_class = ?
+        """, (track, vehicle_class)).fetchone()
+        conn.close()
+        total = int(row[0] or 0)
+        distinct = int(row[1] or 0)
+        effective = distinct + 0.25 * max(0, total - distinct)
+        coverage_score = min(distinct / 12.0, 1.0)
+        volume_score = min(effective / 40.0, 1.0)
+        score = round(10.0 * (0.65 * coverage_score + 0.35 * volume_score), 1)
+        return {
+            "score": score,
+            "total_points": total,
+            "distinct_ratios": distinct,
+            "effective_points": round(effective, 1),
+        }
     
     def get_stats(self) -> Dict[str, any]:
         """Get database statistics"""
@@ -396,7 +426,8 @@ class CurveDatabase:
         vehicle_class: str, 
         ratio: float, 
         lap_time: float, 
-        session_type: str
+        session_type: str,
+        vehicle_name: Optional[str] = None,
     ) -> bool:
         """Add a new data point to the database"""
         try:
@@ -404,9 +435,10 @@ class CurveDatabase:
             cursor = conn.cursor()
             with get_database_lock(self.db_path):
                 cursor.execute("""
-                    INSERT INTO data_points (track, vehicle_class, ratio, lap_time, session_type)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (track, vehicle_class, float(ratio), float(lap_time), session_type))
+                    INSERT INTO data_points
+                        (track, vehicle_class, vehicle_name, ratio, lap_time, session_type)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (track, vehicle_class, vehicle_name, float(ratio), float(lap_time), session_type))
                 conn.commit()
             conn.close()
             return True
@@ -414,7 +446,7 @@ class CurveDatabase:
             print(f"Error adding data point: {e}")
             return False
 
-    def add_data_points_batch(self, points: List[Tuple[str, str, float, float, str]]) -> int:
+    def add_data_points_batch(self, points: List[Tuple]) -> int:
         """Add multiple data points in batch"""
         if not points:
             return 0
@@ -424,12 +456,15 @@ class CurveDatabase:
         
         added = 0
         with get_database_lock(self.db_path):
-            for track, vehicle_class, ratio, lap_time, session_type in points:
+            for point in points:
                 try:
+                    track, vehicle_class, ratio, lap_time, session_type = point[:5]
+                    vehicle_name = point[5] if len(point) > 5 else None
                     cursor.execute("""
-                        INSERT INTO data_points (track, vehicle_class, ratio, lap_time, session_type)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (track, vehicle_class, ratio, lap_time, session_type))
+                        INSERT INTO data_points
+                            (track, vehicle_class, vehicle_name, ratio, lap_time, session_type)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (track, vehicle_class, vehicle_name, ratio, lap_time, session_type))
                     added += 1
                 except Exception as e:
                     logger.error("Error adding point: %s", e)

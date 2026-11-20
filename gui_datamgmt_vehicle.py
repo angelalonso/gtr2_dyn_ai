@@ -9,6 +9,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import json
 import threading
+import sqlite3
+import copy
 from pathlib import Path
 from typing import List, Set, Optional
 
@@ -91,6 +93,8 @@ class VehicleClassesManager:
     def __init__(self, file_path: Path = None):
         self.file_path = file_path or get_vehicle_classes_path()
         self.data = {}
+        self.db_path = "ai_data.db"
+        self._saved_data = {}
         self.load()
     
     def load(self) -> bool:
@@ -102,17 +106,65 @@ class VehicleClassesManager:
         try:
             with open(self.file_path, 'r', encoding='utf-8') as f:
                 self.data = json.load(f)
+            self._saved_data = copy.deepcopy(self.data)
             return True
         except Exception as e:
             print(f"Error loading vehicle classes: {e}")
             self.data = DEFAULT_VEHICLE_CLASSES.copy()
+            self._saved_data = copy.deepcopy(self.data)
             return False
+
+    @staticmethod
+    def _vehicle_key(value: str) -> str:
+        return " ".join("".join(c.lower() if c.isalnum() else " " for c in value).split())
+
+    def _reconcile_database(self, previous_data: dict) -> None:
+        """Move provenance-aware points when a car changes class."""
+        old_classes = {
+            self._vehicle_key(vehicle): class_name
+            for class_name, class_data in previous_data.items()
+            for vehicle in class_data.get("vehicles", [])
+        }
+        new_classes = {
+            self._vehicle_key(vehicle): class_name
+            for class_name, class_data in self.data.items()
+            for vehicle in class_data.get("vehicles", [])
+        }
+        changed = {
+            key: new_classes.get(key, "Unknown")
+            for key in set(old_classes) | set(new_classes)
+            if new_classes.get(key, "Unknown") != old_classes.get(key, "Unknown")
+        }
+        if not changed:
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(data_points)")]
+            if not columns:
+                return
+            if "vehicle_name" not in columns:
+                conn.execute("ALTER TABLE data_points ADD COLUMN vehicle_name TEXT")
+            for vehicle_key, class_name in changed.items():
+                cursor = conn.execute("SELECT DISTINCT vehicle_name FROM data_points WHERE vehicle_name IS NOT NULL")
+                for (vehicle_name,) in cursor.fetchall():
+                    if self._vehicle_key(vehicle_name) == vehicle_key:
+                        conn.execute(
+                            "UPDATE data_points SET vehicle_class = ? WHERE vehicle_name = ?",
+                            (class_name, vehicle_name),
+                        )
+            conn.commit()
+        finally:
+            conn.close()
     
     def save(self) -> bool:
         try:
+            previous_data = copy.deepcopy(self._saved_data)
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.file_path, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
+            self._reconcile_database(previous_data)
+            self._saved_data = copy.deepcopy(self.data)
             # Clear the vehicle scan cache whenever classes are saved
             clear_vehicle_scan_cache()
             return True
@@ -449,6 +501,7 @@ class VehicleTab(tk.Frame):
         super().__init__(parent)
         self.parent = parent
         self.manager = VehicleClassesManager()
+        self.manager.db_path = get_config_with_defaults().get('db_path', 'ai_data.db')
         self.imported_vehicles = set()
         self.current_class = None
         self.gtr2_path = None
@@ -661,6 +714,7 @@ class VehicleTab(tk.Frame):
             self.parent.destroy()
     
     def save_data(self):
+        self.manager.db_path = get_config_with_defaults().get('db_path', 'ai_data.db')
         if self.manager.save():
             # Update the cache file after saving changes
             if hasattr(self, 'gtr2_path') and self.gtr2_path:

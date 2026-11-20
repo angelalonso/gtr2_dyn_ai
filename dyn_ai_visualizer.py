@@ -8,6 +8,7 @@ Runs its own pre-run checks before starting
 import sys
 import logging
 import sqlite3
+import argparse
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -44,6 +45,7 @@ class TrackClassSelector(QWidget):
         self.db = db
         self.all_tracks = []
         self.all_classes_for_track = {}
+        self.class_quality_for_track = {}
         self.current_track = ""
         self.current_class = ""
         self.base_path = get_base_path()
@@ -129,11 +131,12 @@ class TrackClassSelector(QWidget):
                 except sqlite3.OperationalError:
                     pass
                 
-                class_set = set()
-                for vehicle in all_vehicles:
-                    vehicle_class = get_vehicle_class(vehicle, class_mapping)
-                    class_set.add(vehicle_class)
+                class_set = set(all_vehicles)
                 self.all_classes_for_track[track] = sorted(class_set)
+                self.class_quality_for_track[track] = {
+                    vehicle_class: self.db.get_data_quality(track, vehicle_class)
+                    for vehicle_class in class_set
+                }
             
             conn.close()
         
@@ -235,9 +238,16 @@ class TrackClassSelector(QWidget):
         list_widget = QListWidget()
         list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
         for cls in track_classes:
-            list_widget.addItem(cls)
-        
-        items = list_widget.findItems(self.current_class, Qt.MatchExactly)
+            quality = self.class_quality_for_track.get(self.current_track, {}).get(cls, {})
+            score = quality.get("score", 0.0)
+            item = QListWidgetItem(f"{cls}  [Data {score:.1f}/10]")
+            item.setData(Qt.UserRole, cls)
+            list_widget.addItem(item)
+
+        items = [
+            list_widget.item(i) for i in range(list_widget.count())
+            if list_widget.item(i).data(Qt.UserRole) == self.current_class
+        ]
         if items:
             list_widget.setCurrentItem(items[0])
         
@@ -249,7 +259,7 @@ class TrackClassSelector(QWidget):
         layout.addWidget(buttons)
         
         if dialog.exec_() == QDialog.Accepted and list_widget.currentItem():
-            selected = list_widget.currentItem().text()
+            selected = list_widget.currentItem().data(Qt.UserRole)
             if selected != self.current_class:
                 self.current_class = selected
                 self.class_label.setText(selected)
@@ -270,7 +280,8 @@ class TrackClassSelector(QWidget):
 class FormulaVisualizer(QMainWindow):
     """Standalone Formula Visualizer window with real-time data"""
 
-    def __init__(self, config_file: str = "cfg.yml"):
+    def __init__(self, config_file: str = "cfg.yml",
+                 initial_track: str = "", initial_vehicle_class: str = ""):
         super().__init__()
         self.config_file = config_file
         self.config = get_config_with_defaults(config_file)
@@ -355,6 +366,15 @@ class FormulaVisualizer(QMainWindow):
         self.curve_graph.points_deleted.connect(self.on_points_deleted)
         
         self.selector.load_data()
+        if initial_track in self.selector.all_tracks:
+            self.selector.current_track = initial_track
+            self.selector.track_label.setText(initial_track)
+            self.selector._update_classes_for_track()
+            self.current_track = initial_track
+            if initial_vehicle_class in self.selector.all_classes_for_track.get(initial_track, []):
+                self.selector.current_class = initial_vehicle_class
+                self.selector.class_label.setText(initial_vehicle_class)
+                self.current_vehicle_class = initial_vehicle_class
         QTimer.singleShot(100, self._emit_initial_selection)
 
     def _emit_initial_selection(self):
@@ -1167,6 +1187,10 @@ class FormulaVisualizer(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Dynamic AI Formula Visualizer")
+    parser.add_argument("--track", default="")
+    parser.add_argument("--vehicle-class", default="")
+    args = parser.parse_args()
     create_default_config_if_missing()
     db_path = get_db_path()
     if not Path(db_path).exists():
@@ -1180,7 +1204,10 @@ def main():
     
     setup_dark_theme(app)
 
-    window = FormulaVisualizer()
+    window = FormulaVisualizer(
+        initial_track=args.track,
+        initial_vehicle_class=args.vehicle_class,
+    )
     window.show()
     sys.exit(app.exec_())
 

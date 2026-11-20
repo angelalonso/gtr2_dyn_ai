@@ -74,7 +74,7 @@ def process_files(config_file: str, files: Iterable[Path], apply_ratios: bool) -
 
         points = []
         for track, vehicle, ratio, lap_time, session_type in data.to_data_points_with_vehicles():
-            points.append((track, get_vehicle_class(vehicle, class_mapping), ratio, lap_time, session_type))
+            points.append((track, get_vehicle_class(vehicle, class_mapping), ratio, lap_time, session_type, vehicle))
         db.add_data_points_batch(points)
 
         if autopilot:

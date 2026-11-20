@@ -24,6 +24,30 @@ class TestQuartileTarget(unittest.TestCase):
             )
             self.assertAlmostEqual(target, 91.25)
 
+    def test_all_bands_use_their_ordered_quartile_centers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = CurveDatabase(str(Path(directory) / "data.db"))
+            engine = AutopilotEngine(db, FormulaManager(db))
+            ai_times = [90.0, 92.0, 94.0, 96.0, 98.0, 100.0, 102.0, 104.0]
+            expected = {
+                "top_25": 91.75,
+                "second_25": 95.25,
+                "third_25": 98.75,
+                "bottom_25": 102.25,
+            }
+
+            for band, target_time in expected.items():
+                settings = {
+                    "mode": "quartile_band",
+                    "band": band,
+                    "min_ai_laps": 1,
+                    "min_ai_races": 1,
+                }
+                target = engine.calculate_target_time_from_settings(
+                    min(ai_times), max(ai_times), settings, ai_times, 1
+                )
+                self.assertAlmostEqual(target, target_time)
+
     def test_insufficient_data_falls_back_and_reports_missing_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             db = CurveDatabase(str(Path(directory) / "data.db"))

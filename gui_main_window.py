@@ -305,7 +305,7 @@ class MainWindowTk:
         
         # Toggle switches
         self.autosave_btn = tk.Button(bottom_frame,
-                                       text="Auto-harvest Data (ON)" if self.autosave_enabled else "Auto-harvest Data (OFF)",
+                                       text="Harvest Data ON" if self.autosave_enabled else "Harvest Data OFF",
                                        bg='#4CAF50' if self.autosave_enabled else '#3c3c3c',
                                        fg='white', font=('Arial', 11, 'bold'),
                                        relief=tk.FLAT, padx=18, pady=8,
@@ -313,7 +313,7 @@ class MainWindowTk:
         self.autosave_btn.pack(side=tk.LEFT, padx=5)
         
         self.autoratio_btn = tk.Button(bottom_frame,
-                                        text="Auto-calculate Ratios (ON)" if self.autoratio_enabled else "Auto-calculate Ratios (OFF)",
+                                        text="Auto-Calculation",
                                         bg='#4CAF50' if self.autoratio_enabled else '#3c3c3c',
                                         fg='white', font=('Arial', 11, 'bold'),
                                         relief=tk.FLAT, padx=18, pady=8,
@@ -693,16 +693,16 @@ class MainWindowTk:
     def toggle_autosave(self):
         self.autosave_enabled = not self.autosave_enabled
         self.autosave_btn.config(
-            text="Auto-harvest Data (ON)" if self.autosave_enabled else "Auto-harvest Data (OFF)",
+            text="Harvest Data ON" if self.autosave_enabled else "Harvest Data OFF",
             bg='#4CAF50' if self.autosave_enabled else '#3c3c3c'
         )
-        self._update_status_safe(f"Auto-harvest Data {'ON' if self.autosave_enabled else 'OFF'}")
+        self._update_status_safe(f"Harvest Data {'ON' if self.autosave_enabled else 'OFF'}")
     
     def toggle_autoratio(self):
         self.autoratio_enabled = not self.autoratio_enabled
         self.autopilot_manager.set_enabled(self.autoratio_enabled)
         self.autoratio_btn.config(
-            text="Auto-calculate Ratios (ON)" if self.autoratio_enabled else "Auto-calculate Ratios (OFF)",
+            text="Auto-Calculation",
             bg='#4CAF50' if self.autoratio_enabled else '#3c3c3c'
         )
         self.qual_panel.set_edit_enabled(not self.autoratio_enabled)
@@ -760,15 +760,6 @@ class MainWindowTk:
 
     def configure_ai_target(self):
         readiness = self._get_ai_target_readiness()
-        if not readiness["ready"]:
-            messagebox.showinfo(
-                "AI target bands unavailable",
-                "More AI data is needed before quartile bands can be selected.\n\n"
-                f"Needed: {readiness['needed_laps']} more valid AI laps and "
-                f"{readiness['needed_races']} more race session(s).",
-            )
-            return
-
         dialog = tk.Toplevel(self.root)
         dialog.title("AI Target Band")
         dialog.transient(self.root)
@@ -777,48 +768,178 @@ class MainWindowTk:
         frame.pack(fill=tk.BOTH, expand=True)
         tk.Label(frame, text="Choose the AI pace band to target:",
                  bg='#1e1e1e', fg='white').pack(anchor=tk.W, pady=(0, 10))
-        band = tk.StringVar(value=self.ai_target_settings.get("band", "top_25"))
         options = [
-            ("top_25", "Top 25% (fastest)"),
+            ("top_25", "Top 25% (fastest, hard)"),
             ("second_25", "25% - 50%"),
             ("third_25", "50% - 75%"),
-            ("bottom_25", "Slowest 25%"),
+            ("bottom_25", "Slowest 25% (easy)"),
         ]
         colors = {"top_25": "#4CAF50", "second_25": "#CDDC39",
                   "third_25": "#FBC02D", "bottom_25": "#FF9800"}
-        band_buttons = {}
 
-        def select_band(selected):
-            band.set(selected)
-            for value, button in band_buttons.items():
-                button.config(relief=tk.SUNKEN if value == selected else tk.RAISED)
+        def apply_target(mode, band=None):
+            logger.info(
+                "AI target selection requested: mode=%s, band=%s, track=%s, vehicle_class=%s, "
+                "autoratio_enabled=%s",
+                mode, band, self.current_track, self.current_vehicle_class,
+                self.autoratio_enabled,
+            )
+            self.ai_target_settings["mode"] = mode
+            if band is not None:
+                self.ai_target_settings["band"] = band
+            self.config["ai_target_enabled"] = mode == "quartile_band"
+            self.config["ai_target_band"] = self.ai_target_settings.get("band", "top_25")
+            save_config(self.config, self.config_file)
+            missing_laptimes = self._recalculate_ratios_for_ai_target() or []
+            self._update_ai_target_button()
+            if missing_laptimes:
+                session_labels = {"qual": "Qualifying", "race": "Race"}
+                missing = ", ".join(session_labels.get(item, item) for item in missing_laptimes)
+                status = f"No valid user laptime for {missing}"
+            else:
+                status = "AI target reset to default" if mode == "disabled" else (
+                    f"AI target set to {self.ai_target_settings['band']}"
+                )
+            self._update_status_safe(status)
+            dialog.destroy()
 
         for value, label in options:
             button = tk.Button(
-                frame, text=label, command=lambda selected=value: select_band(selected),
-                bg=colors[value], fg="white" if value in ("top_25", "bottom_25") else "black",
+                frame, text=label,
+                command=lambda selected=value: apply_target("quartile_band", selected),
+                bg=colors[value], fg="#000000" if value == "second_25" else "#111111",
                 relief=tk.FLAT, anchor=tk.W, padx=10, pady=6,
+                state=tk.NORMAL if readiness["ready"] else tk.DISABLED,
             )
             button.pack(fill=tk.X, pady=2)
-            band_buttons[value] = button
-        select_band(band.get())
 
-        def save_target():
-            self.ai_target_settings["mode"] = "quartile_band"
-            self.ai_target_settings["band"] = band.get()
-            self.config["ai_target_enabled"] = True
-            self.config["ai_target_band"] = band.get()
-            save_config(self.config, self.config_file)
-            self._update_ai_target_button()
-            self._update_status_safe(
-                f"AI target set to {band.get()}"
-            )
-            dialog.destroy()
+        if not readiness["ready"]:
+            tk.Label(
+                frame,
+                text=(
+                    "Quartile bands need "
+                    f"{readiness['needed_laps']} more AI laps and "
+                    f"{readiness['needed_races']} more race(s)."
+                ),
+                bg='#1e1e1e', fg='#aaaaaa',
+            ).pack(anchor=tk.W, pady=(8, 0))
 
         tk.Button(
-            frame, text="Apply", command=save_target,
-            bg='#4CAF50', fg='white', relief=tk.FLAT, padx=15, pady=5,
-        ).pack(anchor=tk.E, pady=(12, 0))
+            frame, text="Default (50%)", command=lambda: apply_target("disabled"),
+            bg='#777777', fg='white', relief=tk.FLAT, padx=15, pady=6,
+        ).pack(fill=tk.X, pady=(12, 0))
+
+    def _recalculate_ratios_for_ai_target(self):
+        """Apply the newly selected AI target using the latest user laps."""
+        logger.info(
+            "AI target recalculation started: mode=%s, band=%s, track=%s, vehicle_class=%s",
+            self.ai_target_settings.get("mode"),
+            self.ai_target_settings.get("band"),
+            self.current_track,
+            self.current_vehicle_class,
+        )
+        if not self.current_track or not self.current_vehicle_class:
+            logger.warning(
+                "AI target recalculation skipped: missing track or vehicle class "
+                "(track=%r, vehicle_class=%r)",
+                self.current_track, self.current_vehicle_class,
+            )
+            return
+
+        aiw_path = getattr(self, "current_track_aiw_path", None)
+        if not aiw_path or not aiw_path.exists():
+            aiw_path = self.find_aiw_file(self.current_track)
+        if not aiw_path or not aiw_path.exists():
+            logger.warning("Cannot apply AI target: AIW file not found")
+            return
+        logger.info("AI target recalculation using AIW: %s", aiw_path)
+
+        updates = []
+        missing_laptimes = []
+        for session_type, ratio_name in (("qual", "QualRatio"), ("race", "RaceRatio")):
+            laps = self.user_laptimes_manager.get_laptimes_for_combo(
+                self.current_track, self.current_vehicle_class, session_type
+            )
+            valid_stored_laps = [lap for lap in laps if lap[0] is not None and lap[0] > 0]
+            fallback_time = (
+                self.user_qualifying_sec if session_type == "qual"
+                else self.user_best_lap_sec
+            )
+            latest_time = valid_stored_laps[-1][0] if valid_stored_laps else fallback_time
+            logger.info(
+                "AI target %s inputs: stored_laps=%d, latest_stored=%s, fallback_time=%s, "
+                "selected_time=%s",
+                session_type, len(valid_stored_laps),
+                valid_stored_laps[-1][0] if valid_stored_laps else None,
+                fallback_time, latest_time,
+            )
+            if latest_time is None or latest_time <= 0:
+                logger.warning("AI target %s skipped: no valid user laptime", session_type)
+                missing_laptimes.append(session_type)
+                continue
+
+            if self.ai_target_settings.get("mode") == "quartile_band":
+                target_time, target_info = self.autopilot_manager.get_target_time_for_combo(
+                    self.current_track, self.current_vehicle_class, session_type,
+                    latest_time, self.ai_target_settings
+                )
+                if not target_info.get("active"):
+                    logger.info(
+                        "AI target not ready for %s: %s",
+                        session_type, target_info.get("reason", "insufficient data"),
+                    )
+                    continue
+                logger.info(
+                    "AI target %s result: target_time=%.6f, info=%s",
+                    session_type, target_time, target_info,
+                )
+            else:
+                target_time = latest_time
+                logger.info(
+                    "AI target %s using default mode: target_time=%.6f",
+                    session_type, target_time,
+                )
+
+            new_ratio = self.autopilot_manager.calculate_ratio(
+                self.current_track, self.current_vehicle_class, session_type, target_time
+            )
+            logger.info(
+                "AI target %s formula conversion: target_time=%.6f, calculated_ratio=%s",
+                session_type, target_time, new_ratio,
+            )
+            if new_ratio is None:
+                logger.warning("Cannot calculate %s for AI target time %.3f", ratio_name, target_time)
+                continue
+
+            new_ratio = clamp_ratio(new_ratio, self.min_ratio, self.max_ratio)
+            current_ratio = self.last_qual_ratio if session_type == "qual" else self.last_race_ratio
+            logger.info(
+                "AI target %s ratio comparison: current_ratio=%s, clamped_ratio=%.6f, "
+                "limits=(%.6f, %.6f)",
+                session_type, current_ratio, new_ratio, self.min_ratio, self.max_ratio,
+            )
+            if current_ratio is not None and abs(new_ratio - current_ratio) <= 0.000001:
+                logger.info("AI target %s skipped: calculated ratio is unchanged", session_type)
+                continue
+            if not update_aiw_ratio(aiw_path, ratio_name, new_ratio, self.backup_dir):
+                logger.error("Failed to apply %s for AI target", ratio_name)
+                continue
+            logger.info("AI target %s applied to AIW: %s=%.6f", session_type, ratio_name, new_ratio)
+
+            self.db.save_applied_ratio(
+                self.current_track, self.current_vehicle_class, session_type, new_ratio
+            )
+            if session_type == "qual":
+                self._update_qual_ratio(new_ratio)
+                self._update_qual_read_ratio(new_ratio)
+            else:
+                self._update_race_ratio(new_ratio)
+                self._update_race_read_ratio(new_ratio)
+            updates.append(f"{ratio_name}={new_ratio:.6f}")
+
+        if updates:
+            self._update_status_safe("AI target applied: " + ", ".join(updates))
+        return missing_laptimes
     
     def on_manual_edit(self, session_type: str, new_ratio: float, aiw_path: Path = None):
         """

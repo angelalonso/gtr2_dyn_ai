@@ -1,5 +1,5 @@
-ai_target_band: second_25
-ai_target_enabled: true
+ai_target_band: bottom_25
+ai_target_enabled: false
 ai_target_min_laps: 8
 ai_target_min_races: 2
 base_path: test_mocks

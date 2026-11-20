@@ -772,6 +772,12 @@ class AutopilotEngine:
         min_races = int(settings.get("min_ai_races", 2))
         min_drivers = max(1, math.ceil(min_laps / max(1, min_races)))
         ready = valid_laps >= min_laps and race_count >= min_races
+        logger.info(
+            "AI target samples: track=%s, session=%s, valid_laps=%d, races=%d, "
+            "required_laps=%d, required_races=%d, ready=%s",
+            track, session_type, valid_laps, race_count,
+            min_laps, min_races, ready,
+        )
         if not ai_times:
             return fallback_time, {
                 "active": False, "reason": "no AI times",
@@ -959,13 +965,10 @@ class AutopilotEngine:
                 new_ratio = clamped_ratio
         
         if ai_target_settings and new_ratio and new_ratio != current_ratio:
-            existing_points = self._get_data_points(track, vehicle_class, session_type)
-            if existing_points:
-                ai_times = [t for _, t in existing_points]
-                best_ai_time = min(ai_times)
-                worst_ai_time = max(ai_times)
-                
-                target_time = self.calculate_target_time_from_settings(best_ai_time, worst_ai_time, ai_target_settings)
+            target_time, target_info = self.get_target_time_for_combo(
+                track, vehicle_class, session_type, effective_user_time, ai_target_settings
+            )
+            if target_info.get("active"):
                 adjusted_ratio = self._calculate_new_ratio_direct(target_time, a, b)
                 if adjusted_ratio:
                     adjusted_ratio = clamp_ratio(adjusted_ratio, self._min_ratio, self._max_ratio)
@@ -1108,9 +1111,20 @@ class AutopilotEngine:
     def calculate_ratio_from_formula(self, track: str, vehicle_class: str, session_type: str, lap_time: float) -> Optional[float]:
         formula = self.formula_manager.get_formula_by_class(track, vehicle_class, session_type)
         if not formula:
+            logger.warning(
+                "No formula found for target ratio: track=%s, vehicle_class=%s, session=%s; "
+                "using default formula a=%.3f, b=70.000",
+                track, vehicle_class, session_type, DEFAULT_A_VALUE,
+            )
             formula = Formula(track, vehicle_class, DEFAULT_A_VALUE, 70.0, session_type)
-        
-        return formula.get_ratio_for_time(lap_time)
+        ratio = formula.get_ratio_for_time(lap_time)
+        logger.info(
+            "Formula ratio calculation: track=%s, vehicle_class=%s, session=%s, "
+            "lap_time=%.6f, a=%.6f, b=%.6f, ratio=%s",
+            track, vehicle_class, session_type, lap_time,
+            formula.a, formula.b, ratio,
+        )
+        return ratio
 
 
 class AutopilotManager:
